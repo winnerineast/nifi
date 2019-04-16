@@ -33,6 +33,7 @@ import org.apache.nifi.components.ValidationContext;
 import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessorInitializationContext;
+import org.apache.nifi.processors.standard.util.FTPTransfer;
 import org.apache.nifi.processors.standard.util.FileTransfer;
 import org.apache.nifi.processors.standard.util.SFTPTransfer;
 
@@ -70,6 +71,7 @@ public class GetSFTP extends GetFileTransfer {
         properties.add(SFTPTransfer.PATH_FILTER_REGEX);
         properties.add(SFTPTransfer.POLLING_INTERVAL);
         properties.add(SFTPTransfer.RECURSIVE_SEARCH);
+        properties.add(SFTPTransfer.FOLLOW_SYMLINK);
         properties.add(SFTPTransfer.IGNORE_DOTTED_FILES);
         properties.add(SFTPTransfer.DELETE_ORIGINAL);
         properties.add(SFTPTransfer.CONNECTION_TIMEOUT);
@@ -81,6 +83,12 @@ public class GetSFTP extends GetFileTransfer {
         properties.add(SFTPTransfer.USE_KEEPALIVE_ON_TIMEOUT);
         properties.add(SFTPTransfer.USE_COMPRESSION);
         properties.add(SFTPTransfer.USE_NATURAL_ORDERING);
+        properties.add(SFTPTransfer.PROXY_CONFIGURATION_SERVICE);
+        properties.add(FTPTransfer.PROXY_TYPE);
+        properties.add(FTPTransfer.PROXY_HOST);
+        properties.add(FTPTransfer.PROXY_PORT);
+        properties.add(FTPTransfer.HTTP_PROXY_USERNAME);
+        properties.add(FTPTransfer.HTTP_PROXY_PASSWORD);
         this.properties = Collections.unmodifiableList(properties);
     }
 
@@ -101,6 +109,8 @@ public class GetSFTP extends GetFileTransfer {
                     .valid(false)
                     .build());
         }
+
+        SFTPTransfer.validateProxySpec(context, results);
 
         return results;
     }

@@ -19,6 +19,7 @@ package org.apache.nifi.controller.serialization;
 import org.apache.nifi.connectable.Size;
 import org.apache.nifi.controller.ScheduledState;
 import org.apache.nifi.controller.service.ControllerServiceState;
+import org.apache.nifi.encrypt.EncryptionException;
 import org.apache.nifi.encrypt.StringEncryptor;
 import org.apache.nifi.groups.RemoteProcessGroupPortDescriptor;
 import org.apache.nifi.remote.StandardRemoteProcessGroupPortDescriptor;
@@ -39,6 +40,9 @@ import org.apache.nifi.web.api.dto.ProcessorConfigDTO;
 import org.apache.nifi.web.api.dto.ProcessorDTO;
 import org.apache.nifi.web.api.dto.RemoteProcessGroupDTO;
 import org.apache.nifi.web.api.dto.ReportingTaskDTO;
+import org.apache.nifi.web.api.dto.VersionControlInformationDTO;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;
 
@@ -52,6 +56,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 public class FlowFromDOMFactory {
+    private static final Logger logger = LoggerFactory.getLogger(FlowFromDOMFactory.class);
 
     public static BundleDTO getBundle(final Element bundleElement) {
         if (bundleElement == null) {
@@ -99,6 +104,7 @@ public class FlowFromDOMFactory {
         final ControllerServiceDTO dto = new ControllerServiceDTO();
 
         dto.setId(getString(element, "id"));
+        dto.setVersionedComponentId(getString(element, "versionedComponentId"));
         dto.setName(getString(element, "name"));
         dto.setComments(getString(element, "comment"));
         dto.setType(getString(element, "class"));
@@ -135,10 +141,24 @@ public class FlowFromDOMFactory {
         final ProcessGroupDTO dto = new ProcessGroupDTO();
         final String groupId = getString(element, "id");
         dto.setId(groupId);
+        dto.setVersionedComponentId(getString(element, "versionedComponentId"));
         dto.setParentGroupId(parentId);
         dto.setName(getString(element, "name"));
         dto.setPosition(getPosition(DomUtils.getChild(element, "position")));
         dto.setComments(getString(element, "comment"));
+
+        final Map<String, String> variables = new HashMap<>();
+        final NodeList variableList = DomUtils.getChildNodesByTagName(element, "variable");
+        for (int i = 0; i < variableList.getLength(); i++) {
+            final Element variableElement = (Element) variableList.item(i);
+            final String name = variableElement.getAttribute("name");
+            final String value = variableElement.getAttribute("value");
+            variables.put(name, value);
+        }
+        dto.setVariables(variables);
+
+        final Element versionControlInfoElement = DomUtils.getChild(element, "versionControlInformation");
+        dto.setVersionControlInformation(getVersionControlInformation(versionControlInfoElement));
 
         final Set<ProcessorDTO> processors = new HashSet<>();
         final Set<ConnectionDTO> connections = new HashSet<>();
@@ -203,12 +223,29 @@ public class FlowFromDOMFactory {
         return dto;
     }
 
+    private static VersionControlInformationDTO getVersionControlInformation(final Element versionControlInfoElement) {
+        if (versionControlInfoElement == null) {
+            return null;
+        }
+
+        final VersionControlInformationDTO dto = new VersionControlInformationDTO();
+        dto.setRegistryId(getString(versionControlInfoElement, "registryId"));
+        dto.setBucketId(getString(versionControlInfoElement, "bucketId"));
+        dto.setBucketName(getString(versionControlInfoElement, "bucketName"));
+        dto.setFlowId(getString(versionControlInfoElement, "flowId"));
+        dto.setFlowName(getString(versionControlInfoElement, "flowName"));
+        dto.setFlowDescription(getString(versionControlInfoElement, "flowDescription"));
+        dto.setVersion(getInt(versionControlInfoElement, "version"));
+        return dto;
+    }
+
     public static ConnectionDTO getConnection(final Element element) {
         final ConnectionDTO dto = new ConnectionDTO();
         dto.setId(getString(element, "id"));
         dto.setName(getString(element, "name"));
         dto.setLabelIndex(getOptionalInt(element, "labelIndex"));
         dto.setzIndex(getOptionalLong(element, "zIndex"));
+        dto.setVersionedComponentId(getString(element, "versionedComponentId"));
 
         final List<PositionDTO> bends = new ArrayList<>();
         final Element bendPointsElement = DomUtils.getChild(element, "bendPoints");
@@ -259,12 +296,17 @@ public class FlowFromDOMFactory {
         }
         dto.setPrioritizers(prioritizerClasses);
 
+        dto.setLoadBalanceStrategy(getString(element, "loadBalanceStrategy"));
+        dto.setLoadBalancePartitionAttribute(getString(element, "partitioningAttribute"));
+        dto.setLoadBalanceCompression(getString(element, "loadBalanceCompression"));
+
         return dto;
     }
 
     public static RemoteProcessGroupDTO getRemoteProcessGroup(final Element element, final StringEncryptor encryptor) {
         final RemoteProcessGroupDTO dto = new RemoteProcessGroupDTO();
         dto.setId(getString(element, "id"));
+        dto.setVersionedComponentId(getString(element, "versionedComponentId"));
         dto.setName(getString(element, "name"));
         dto.setTargetUri(getString(element, "url"));
         dto.setTargetUris(getString(element, "urls"));
@@ -289,6 +331,7 @@ public class FlowFromDOMFactory {
     public static LabelDTO getLabel(final Element element) {
         final LabelDTO dto = new LabelDTO();
         dto.setId(getString(element, "id"));
+        dto.setVersionedComponentId(getString(element, "versionedComponentId"));
         dto.setLabel(getString(element, "value"));
         dto.setPosition(getPosition(DomUtils.getChild(element, "position")));
         final Size size = getSize(DomUtils.getChild(element, "size"));
@@ -302,6 +345,7 @@ public class FlowFromDOMFactory {
     public static FunnelDTO getFunnel(final Element element) {
         final FunnelDTO dto = new FunnelDTO();
         dto.setId(getString(element, "id"));
+        dto.setVersionedComponentId(getString(element, "versionedComponentId"));
         dto.setPosition(getPosition(DomUtils.getChild(element, "position")));
 
         return dto;
@@ -310,6 +354,7 @@ public class FlowFromDOMFactory {
     public static PortDTO getPort(final Element element) {
         final PortDTO portDTO = new PortDTO();
         portDTO.setId(getString(element, "id"));
+        portDTO.setVersionedComponentId(getString(element, "versionedComponentId"));
         portDTO.setPosition(getPosition(DomUtils.getChild(element, "position")));
         portDTO.setName(getString(element, "name"));
         portDTO.setComments(getString(element, "comments"));
@@ -353,6 +398,11 @@ public class FlowFromDOMFactory {
         }
 
         descriptor.setId(id);
+
+        final String targetId = getString(element, "targetId");
+        descriptor.setTargetId(targetId == null ? id : targetId);
+
+        descriptor.setVersionedComponentId(getString(element, "versionedComponentId"));
         descriptor.setName(getString(element, "name"));
         descriptor.setComments(getString(element, "comments"));
         descriptor.setConcurrentlySchedulableTaskCount(getInt(element, "maxConcurrentTasks"));
@@ -369,6 +419,7 @@ public class FlowFromDOMFactory {
         final ProcessorDTO dto = new ProcessorDTO();
 
         dto.setId(getString(element, "id"));
+        dto.setVersionedComponentId(getString(element, "versionedComponentId"));
         dto.setName(getString(element, "name"));
         dto.setType(getString(element, "class"));
         dto.setBundle(getBundle(DomUtils.getChild(element, "bundle")));
@@ -492,7 +543,14 @@ public class FlowFromDOMFactory {
 
     private static String decrypt(final String value, final StringEncryptor encryptor) {
         if (value != null && value.startsWith(FlowSerializer.ENC_PREFIX) && value.endsWith(FlowSerializer.ENC_SUFFIX)) {
-            return encryptor.decrypt(value.substring(FlowSerializer.ENC_PREFIX.length(), value.length() - FlowSerializer.ENC_SUFFIX.length()));
+            try {
+                return encryptor.decrypt(value.substring(FlowSerializer.ENC_PREFIX.length(), value.length() - FlowSerializer.ENC_SUFFIX.length()));
+            } catch (EncryptionException e) {
+                final String moreDescriptiveMessage = "There was a problem decrypting a sensitive flow configuration value. " +
+                        "Check that the nifi.sensitive.props.key value in nifi.properties matches the value used to encrypt the flow.xml.gz file";
+                logger.error(moreDescriptiveMessage, e);
+                throw new EncryptionException(moreDescriptiveMessage, e);
+            }
         } else {
             return value;
         }

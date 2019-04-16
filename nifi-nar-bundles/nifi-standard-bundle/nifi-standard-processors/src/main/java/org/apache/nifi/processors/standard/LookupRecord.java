@@ -17,18 +17,7 @@
 
 package org.apache.nifi.processors.standard;
 
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
-import java.util.stream.Collectors;
-
+import org.apache.nifi.annotation.behavior.DynamicProperty;
 import org.apache.nifi.annotation.behavior.EventDriven;
 import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
@@ -44,6 +33,7 @@ import org.apache.nifi.components.AllowableValue;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.ValidationContext;
 import org.apache.nifi.components.ValidationResult;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.lookup.LookupService;
 import org.apache.nifi.processor.ProcessContext;
@@ -54,10 +44,25 @@ import org.apache.nifi.record.path.RecordPath;
 import org.apache.nifi.record.path.RecordPathResult;
 import org.apache.nifi.record.path.util.RecordPathCache;
 import org.apache.nifi.record.path.validation.RecordPathValidator;
+import org.apache.nifi.serialization.record.DataType;
 import org.apache.nifi.serialization.record.Record;
+import org.apache.nifi.serialization.record.RecordField;
+import org.apache.nifi.serialization.record.RecordFieldType;
 import org.apache.nifi.serialization.record.RecordSchema;
 import org.apache.nifi.serialization.record.util.DataTypeUtils;
 import org.apache.nifi.util.Tuple;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 
 @EventDriven
@@ -68,7 +73,7 @@ import org.apache.nifi.util.Tuple;
     @WritesAttribute(attribute = "mime.type", description = "Sets the mime.type attribute to the MIME Type specified by the Record Writer"),
     @WritesAttribute(attribute = "record.count", description = "The number of records in the FlowFile")
 })
-@Tags({"lookup", "enrichment", "route", "record", "csv", "json", "avro", "logs", "convert", "filter"})
+@Tags({"lookup", "enrichment", "route", "record", "csv", "json", "avro", "database", "db", "logs", "convert", "filter"})
 @CapabilityDescription("Extracts one or more fields from a Record and looks up a value for those fields in a LookupService. If a result is returned by the LookupService, "
     + "that result is optionally added to the Record. In this case, the processor functions as an Enrichment processor. Regardless, the Record is then "
     + "routed to either the 'matched' relationship or 'unmatched' relationship (if the 'Routing Strategy' property is configured to do so), "
@@ -80,7 +85,10 @@ import org.apache.nifi.util.Tuple;
     + "that match will be updated. If there is no match in the configured LookupService, then no fields will be updated. I.e., it will not overwrite an existing value in the Record "
     + "with a null value. Please note, however, that if the results returned by the LookupService are not accounted for in your schema (specifically, "
     + "the schema that is configured for your Record Writer) then the fields will not be written out to the FlowFile.")
-@SeeAlso(value = {ConvertRecord.class, SplitRecord.class}, classNames = {"org.apache.nifi.lookup.SimpleKeyValueLookupService", "org.apache.nifi.lookup.maxmind.IPLookupService"})
+@DynamicProperty(name = "Value To Lookup", value = "Valid Record Path", expressionLanguageScope = ExpressionLanguageScope.FLOWFILE_ATTRIBUTES,
+                    description = "A RecordPath that points to the field whose value will be looked up in the configured Lookup Service")
+@SeeAlso(value = {ConvertRecord.class, SplitRecord.class},
+        classNames = {"org.apache.nifi.lookup.SimpleKeyValueLookupService", "org.apache.nifi.lookup.maxmind.IPLookupService", "org.apache.nifi.lookup.db.DatabaseRecordLookupService"})
 public class LookupRecord extends AbstractRouteRecord<Tuple<Map<String, RecordPath>, RecordPath>> {
 
     private volatile RecordPathCache recordPathCache = new RecordPathCache(25);
@@ -91,6 +99,11 @@ public class LookupRecord extends AbstractRouteRecord<Tuple<Map<String, RecordPa
     static final AllowableValue ROUTE_TO_MATCHED_UNMATCHED = new AllowableValue("route-to-matched-unmatched", "Route to 'matched' or 'unmatched'",
         "Records will be routed to either a 'matched' or an 'unmatched' Relationship depending on whether or not there was a match in the configured Lookup Service. "
             + "A single input FlowFile may result in two different output FlowFiles.");
+
+    static final AllowableValue RESULT_ENTIRE_RECORD = new AllowableValue("insert-entire-record", "Insert Entire Record",
+        "The entire Record that is retrieved from the Lookup Service will be inserted into the destination path.");
+    static final AllowableValue RESULT_RECORD_FIELDS = new AllowableValue("record-fields", "Insert Record Fields",
+        "All of the fields in the Record that is retrieved from the Lookup Service will be inserted into the destination path.");
 
     static final PropertyDescriptor LOOKUP_SERVICE = new PropertyDescriptor.Builder()
         .name("lookup-service")
@@ -107,15 +120,25 @@ public class LookupRecord extends AbstractRouteRecord<Tuple<Map<String, RecordPa
             + "If not specified, the value that is returned from the Lookup Service will be ignored, except for determining whether the FlowFile should "
             + "be routed to the 'matched' or 'unmatched' Relationship.")
         .addValidator(new RecordPathValidator())
-        .expressionLanguageSupported(true)
+        .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
         .required(false)
+        .build();
+
+    static final PropertyDescriptor RESULT_CONTENTS = new PropertyDescriptor.Builder()
+        .name("result-contents")
+        .displayName("Record Result Contents")
+        .description("When a result is obtained that contains a Record, this property determines whether the Record itself is inserted at the configured "
+            + "path or if the contents of the Record (i.e., the sub-fields) will be inserted at the configured path.")
+        .allowableValues(RESULT_ENTIRE_RECORD, RESULT_RECORD_FIELDS)
+        .defaultValue(RESULT_ENTIRE_RECORD.getValue())
+        .required(true)
         .build();
 
     static final PropertyDescriptor ROUTING_STRATEGY = new PropertyDescriptor.Builder()
         .name("routing-strategy")
         .displayName("Routing Strategy")
         .description("Specifies how to route records after a Lookup has completed")
-        .expressionLanguageSupported(false)
+        .expressionLanguageSupported(ExpressionLanguageScope.NONE)
         .allowableValues(ROUTE_TO_SUCCESS, ROUTE_TO_MATCHED_UNMATCHED)
         .defaultValue(ROUTE_TO_SUCCESS.getValue())
         .required(true)
@@ -138,7 +161,7 @@ public class LookupRecord extends AbstractRouteRecord<Tuple<Map<String, RecordPa
     private static final Set<Relationship> UNMATCHED_COLLECTION = Collections.singleton(REL_UNMATCHED);
     private static final Set<Relationship> SUCCESS_COLLECTION = Collections.singleton(REL_SUCCESS);
 
-    private volatile Set<Relationship> relationships = new HashSet<>(Arrays.asList(new Relationship[] {REL_SUCCESS, REL_FAILURE}));
+    private volatile Set<Relationship> relationships = new HashSet<>(Arrays.asList(REL_SUCCESS, REL_FAILURE));
     private volatile boolean routeToMatchedUnmatched = false;
 
     @OnScheduled
@@ -158,6 +181,7 @@ public class LookupRecord extends AbstractRouteRecord<Tuple<Map<String, RecordPa
         properties.add(LOOKUP_SERVICE);
         properties.add(RESULT_RECORD_PATH);
         properties.add(ROUTING_STRATEGY);
+        properties.add(RESULT_CONTENTS);
         return properties;
     }
 
@@ -167,7 +191,7 @@ public class LookupRecord extends AbstractRouteRecord<Tuple<Map<String, RecordPa
             .name(propertyDescriptorName)
             .description("A RecordPath that points to the field whose value will be looked up in the configured Lookup Service")
             .addValidator(new RecordPathValidator())
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .required(false)
             .dynamic(true)
             .build();
@@ -177,8 +201,8 @@ public class LookupRecord extends AbstractRouteRecord<Tuple<Map<String, RecordPa
     @SuppressWarnings("unchecked")
     protected Collection<ValidationResult> customValidate(final ValidationContext validationContext) {
         final Set<String> dynamicPropNames = validationContext.getProperties().keySet().stream()
-            .filter(prop -> prop.isDynamic())
-            .map(prop -> prop.getName())
+            .filter(PropertyDescriptor::isDynamic)
+            .map(PropertyDescriptor::getName)
             .collect(Collectors.toSet());
 
         if (dynamicPropNames.isEmpty()) {
@@ -240,7 +264,7 @@ public class LookupRecord extends AbstractRouteRecord<Tuple<Map<String, RecordPa
         final Tuple<Map<String, RecordPath>, RecordPath> flowFileContext) {
 
         final Map<String, RecordPath> recordPaths = flowFileContext.getKey();
-        final Map<String, String> lookupCoordinates = new HashMap<>(recordPaths.size());
+        final Map<String, Object> lookupCoordinates = new HashMap<>(recordPaths.size());
 
         for (final Map.Entry<String, RecordPath> entry : recordPaths.entrySet()) {
             final String coordinateKey = entry.getKey();
@@ -265,18 +289,19 @@ public class LookupRecord extends AbstractRouteRecord<Tuple<Map<String, RecordPa
             }
 
             final FieldValue fieldValue = lookupFieldValues.get(0);
-            final String coordinateValue = DataTypeUtils.toString(fieldValue.getValue(), (String) null);
+            final Object coordinateValue = (fieldValue.getValue() instanceof Number || fieldValue.getValue() instanceof Boolean)
+                    ? fieldValue.getValue() : DataTypeUtils.toString(fieldValue.getValue(), (String) null);
             lookupCoordinates.put(coordinateKey, coordinateValue);
         }
 
-        final Optional<?> lookupValue;
+        final Optional<?> lookupValueOption;
         try {
-            lookupValue = lookupService.lookup(lookupCoordinates);
+            lookupValueOption = lookupService.lookup(lookupCoordinates, flowFile.getAttributes());
         } catch (final Exception e) {
             throw new ProcessException("Failed to lookup coordinates " + lookupCoordinates + " in Lookup Service", e);
         }
 
-        if (!lookupValue.isPresent()) {
+        if (!lookupValueOption.isPresent()) {
             final Set<Relationship> rels = routeToMatchedUnmatched ? UNMATCHED_COLLECTION : SUCCESS_COLLECTION;
             return rels;
         }
@@ -284,11 +309,52 @@ public class LookupRecord extends AbstractRouteRecord<Tuple<Map<String, RecordPa
         // Ensure that the Record has the appropriate schema to account for the newly added values
         final RecordPath resultPath = flowFileContext.getValue();
         if (resultPath != null) {
-            record.incorporateSchema(writeSchema);
-
-            final Object replacementValue = lookupValue.get();
+            final Object lookupValue = lookupValueOption.get();
             final RecordPathResult resultPathResult = flowFileContext.getValue().evaluate(record);
-            resultPathResult.getSelectedFields().forEach(fieldVal -> fieldVal.updateValue(replacementValue));
+
+            final String resultContentsValue = context.getProperty(RESULT_CONTENTS).getValue();
+            if (RESULT_RECORD_FIELDS.getValue().equals(resultContentsValue) && lookupValue instanceof Record) {
+                final Record lookupRecord = (Record) lookupValue;
+
+                // User wants to add all fields of the resultant Record to the specified Record Path.
+                // If the destination Record Path returns to us a Record, then we will add all field values of
+                // the Lookup Record to the destination Record. However, if the destination Record Path returns
+                // something other than a Record, then we can't add the fields to it. We can only replace it,
+                // because it doesn't make sense to add fields to anything but a Record.
+                resultPathResult.getSelectedFields().forEach(fieldVal -> {
+                    final Object destinationValue = fieldVal.getValue();
+
+                    if (destinationValue instanceof Record) {
+                        final Record destinationRecord = (Record) destinationValue;
+
+                        for (final String fieldName : lookupRecord.getRawFieldNames()) {
+                            final Object value = lookupRecord.getValue(fieldName);
+
+                            final Optional<RecordField> recordFieldOption = lookupRecord.getSchema().getField(fieldName);
+                            if (recordFieldOption.isPresent()) {
+                                // Even if the looked up field is not nullable, if the lookup key didn't match with any record,
+                                // and matched/unmatched records are written to the same FlowFile routed to 'success' relationship,
+                                // then enriched fields should be nullable to support unmatched records whose enriched fields will be null.
+                                RecordField field = recordFieldOption.get();
+                                if (!routeToMatchedUnmatched && !field.isNullable()) {
+                                    field = new RecordField(field.getFieldName(), field.getDataType(), field.getDefaultValue(), field.getAliases(), true);
+                                }
+                                destinationRecord.setValue(field, value);
+                            } else {
+                                destinationRecord.setValue(fieldName, value);
+                            }
+                        }
+                    } else {
+                        final Optional<Record> parentOption = fieldVal.getParentRecord();
+                        parentOption.ifPresent(parent -> parent.setValue(fieldVal.getField(), lookupRecord));
+                    }
+                });
+            } else {
+                final DataType inferredDataType = DataTypeUtils.inferDataType(lookupValue, RecordFieldType.STRING.getDataType());
+                resultPathResult.getSelectedFields().forEach(fieldVal -> fieldVal.updateValue(lookupValue, inferredDataType));
+            }
+
+            record.incorporateInactiveFields();
         }
 
         final Set<Relationship> rels = routeToMatchedUnmatched ? MATCHED_COLLECTION : SUCCESS_COLLECTION;

@@ -16,36 +16,20 @@
  */
 package org.apache.nifi.controller.repository;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
-import static org.mockito.Matchers.any;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.when;
-
-import java.io.File;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Queue;
-import java.util.Set;
-import java.util.UUID;
-import java.util.concurrent.TimeUnit;
-
 import org.apache.nifi.connectable.Connectable;
 import org.apache.nifi.connectable.Connection;
-import org.apache.nifi.controller.StandardFlowFileQueue;
 import org.apache.nifi.controller.queue.DropFlowFileStatus;
 import org.apache.nifi.controller.queue.FlowFileQueue;
+import org.apache.nifi.controller.queue.FlowFileQueueSize;
 import org.apache.nifi.controller.queue.ListFlowFileStatus;
+import org.apache.nifi.controller.queue.LoadBalanceCompression;
+import org.apache.nifi.controller.queue.LoadBalanceStrategy;
+import org.apache.nifi.controller.queue.NopConnectionEventListener;
+import org.apache.nifi.controller.queue.QueueDiagnostics;
 import org.apache.nifi.controller.queue.QueueSize;
+import org.apache.nifi.controller.queue.StandardFlowFileQueue;
+import org.apache.nifi.controller.queue.StandardLocalQueuePartitionDiagnostics;
+import org.apache.nifi.controller.queue.StandardQueueDiagnostics;
 import org.apache.nifi.controller.repository.claim.ContentClaim;
 import org.apache.nifi.controller.repository.claim.ResourceClaim;
 import org.apache.nifi.controller.repository.claim.ResourceClaimManager;
@@ -70,6 +54,30 @@ import org.mockito.stubbing.Answer;
 import org.wali.MinimalLockingWriteAheadLog;
 import org.wali.WriteAheadRepository;
 
+import java.io.File;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
+import static org.mockito.Matchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.when;
+
+@SuppressWarnings("deprecation")
 public class TestWriteAheadFlowFileRepository {
 
     @BeforeClass
@@ -92,6 +100,28 @@ public class TestWriteAheadFlowFileRepository {
     @Ignore("Intended only for local performance testing before/after making changes")
     public void testUpdatePerformance() throws IOException, InterruptedException {
         final FlowFileQueue queue = new FlowFileQueue() {
+            private LoadBalanceCompression compression = LoadBalanceCompression.DO_NOT_COMPRESS;
+
+            @Override
+            public void startLoadBalancing() {
+            }
+
+            @Override
+            public void stopLoadBalancing() {
+            }
+
+            @Override
+            public void offloadQueue() {
+            }
+
+            @Override
+            public void resetOffloadedQueue() {
+            }
+
+            @Override
+            public boolean isActivelyLoadBalancing() {
+                return false;
+            }
 
             @Override
             public String getIdentifier() {
@@ -150,16 +180,16 @@ public class TestWriteAheadFlowFileRepository {
             }
 
             @Override
-            public QueueSize getUnacknowledgedQueueSize() {
-                return null;
-            }
-
-            @Override
             public void acknowledge(FlowFileRecord flowFile) {
             }
 
             @Override
             public void acknowledge(Collection<FlowFileRecord> flowFiles) {
+            }
+
+            @Override
+            public boolean isUnacknowledgedFlowFile() {
+                return false;
             }
 
             @Override
@@ -183,11 +213,6 @@ public class TestWriteAheadFlowFileRepository {
             @Override
             public List<FlowFileRecord> poll(int maxResults, Set<FlowFileRecord> expiredRecords) {
                 return null;
-            }
-
-            @Override
-            public long drainQueue(Queue<FlowFileRecord> sourceQueue, List<FlowFileRecord> destination, int maxResults, Set<FlowFileRecord> expiredRecords) {
-                return 0;
             }
 
             @Override
@@ -247,6 +272,44 @@ public class TestWriteAheadFlowFileRepository {
             @Override
             public void verifyCanList() throws IllegalStateException {
             }
+
+            @Override
+            public QueueDiagnostics getQueueDiagnostics() {
+                final FlowFileQueueSize size = new FlowFileQueueSize(size().getObjectCount(), size().getByteCount(), 0, 0, 0, 0, 0);
+                return new StandardQueueDiagnostics(new StandardLocalQueuePartitionDiagnostics(size, false, false), Collections.emptyList());
+            }
+
+            @Override
+            public void lock() {
+            }
+
+            @Override
+            public void unlock() {
+            }
+
+            @Override
+            public void setLoadBalanceStrategy(final LoadBalanceStrategy strategy, final String partitioningAttribute) {
+            }
+
+            @Override
+            public LoadBalanceStrategy getLoadBalanceStrategy() {
+                return null;
+            }
+
+            @Override
+            public void setLoadBalanceCompression(final LoadBalanceCompression compression) {
+                this.compression = compression;
+            }
+
+            @Override
+            public LoadBalanceCompression getLoadBalanceCompression() {
+                return compression;
+            }
+
+            @Override
+            public String getPartitioningAttribute() {
+                return null;
+            }
         };
 
 
@@ -260,7 +323,7 @@ public class TestWriteAheadFlowFileRepository {
         assertTrue(path.toFile().mkdirs());
 
         final ResourceClaimManager claimManager = new StandardResourceClaimManager();
-        final RepositoryRecordSerdeFactory serdeFactory = new RepositoryRecordSerdeFactory(claimManager);
+        final StandardRepositoryRecordSerdeFactory serdeFactory = new StandardRepositoryRecordSerdeFactory(claimManager);
         final WriteAheadRepository<RepositoryRecord> repo = new MinimalLockingWriteAheadLog<>(path, numPartitions, serdeFactory, null);
         final Collection<RepositoryRecord> initialRecs = repo.recoverRecords();
         assertTrue(initialRecs.isEmpty());
@@ -334,6 +397,101 @@ public class TestWriteAheadFlowFileRepository {
     }
 
 
+    @Test
+    public void testGetLocationSuffix() {
+        assertEquals("/", WriteAheadFlowFileRepository.getLocationSuffix("/"));
+        assertEquals("", WriteAheadFlowFileRepository.getLocationSuffix(""));
+        assertEquals(null, WriteAheadFlowFileRepository.getLocationSuffix(null));
+        assertEquals("test.txt", WriteAheadFlowFileRepository.getLocationSuffix("test.txt"));
+        assertEquals("test.txt", WriteAheadFlowFileRepository.getLocationSuffix("/test.txt"));
+        assertEquals("test.txt", WriteAheadFlowFileRepository.getLocationSuffix("/tmp/test.txt"));
+        assertEquals("test.txt", WriteAheadFlowFileRepository.getLocationSuffix("//test.txt"));
+        assertEquals("test.txt", WriteAheadFlowFileRepository.getLocationSuffix("/path/to/other/file/repository/test.txt"));
+        assertEquals("test.txt", WriteAheadFlowFileRepository.getLocationSuffix("test.txt/"));
+        assertEquals("test.txt", WriteAheadFlowFileRepository.getLocationSuffix("/path/to/test.txt/"));
+    }
+
+    @Test
+    public void testSwapLocationsRestored() throws IOException {
+        final Path path = Paths.get("target/test-swap-repo");
+        if (Files.exists(path)) {
+            FileUtils.deleteFile(path.toFile(), true);
+        }
+
+        final WriteAheadFlowFileRepository repo = new WriteAheadFlowFileRepository(NiFiProperties.createBasicNiFiProperties(null, null));
+        repo.initialize(new StandardResourceClaimManager());
+
+        final TestQueueProvider queueProvider = new TestQueueProvider();
+        repo.loadFlowFiles(queueProvider);
+
+        final Connection connection = Mockito.mock(Connection.class);
+        when(connection.getIdentifier()).thenReturn("1234");
+
+        final FlowFileQueue queue = Mockito.mock(FlowFileQueue.class);
+        when(queue.getIdentifier()).thenReturn("1234");
+        when(connection.getFlowFileQueue()).thenReturn(queue);
+
+        queueProvider.addConnection(connection);
+
+        StandardFlowFileRecord.Builder ffBuilder = new StandardFlowFileRecord.Builder();
+        ffBuilder.id(1L);
+        ffBuilder.size(0L);
+        final FlowFileRecord flowFileRecord = ffBuilder.build();
+
+        final List<RepositoryRecord> records = new ArrayList<>();
+        final StandardRepositoryRecord record = new StandardRepositoryRecord(queue, flowFileRecord, "swap123");
+        record.setDestination(queue);
+        records.add(record);
+
+        repo.updateRepository(records);
+        repo.close();
+
+        // restore
+        final WriteAheadFlowFileRepository repo2 = new WriteAheadFlowFileRepository(NiFiProperties.createBasicNiFiProperties(null, null));
+        repo2.initialize(new StandardResourceClaimManager());
+        repo2.loadFlowFiles(queueProvider);
+        assertTrue(repo2.isValidSwapLocationSuffix("swap123"));
+        assertFalse(repo2.isValidSwapLocationSuffix("other"));
+        repo2.close();
+    }
+
+    @Test
+    public void testSwapLocationsUpdatedOnRepoUpdate() throws IOException {
+        final Path path = Paths.get("target/test-swap-repo");
+        if (Files.exists(path)) {
+            FileUtils.deleteFile(path.toFile(), true);
+        }
+
+        final WriteAheadFlowFileRepository repo = new WriteAheadFlowFileRepository(NiFiProperties.createBasicNiFiProperties(null, null));
+        repo.initialize(new StandardResourceClaimManager());
+
+        final TestQueueProvider queueProvider = new TestQueueProvider();
+        repo.loadFlowFiles(queueProvider);
+
+        final Connection connection = Mockito.mock(Connection.class);
+        when(connection.getIdentifier()).thenReturn("1234");
+
+        final FlowFileQueue queue = Mockito.mock(FlowFileQueue.class);
+        when(queue.getIdentifier()).thenReturn("1234");
+        when(connection.getFlowFileQueue()).thenReturn(queue);
+
+        queueProvider.addConnection(connection);
+
+        StandardFlowFileRecord.Builder ffBuilder = new StandardFlowFileRecord.Builder();
+        ffBuilder.id(1L);
+        ffBuilder.size(0L);
+        final FlowFileRecord flowFileRecord = ffBuilder.build();
+
+        final List<RepositoryRecord> records = new ArrayList<>();
+        final StandardRepositoryRecord record = new StandardRepositoryRecord(queue, flowFileRecord, "/tmp/swap123");
+        record.setDestination(queue);
+        records.add(record);
+
+        assertFalse(repo.isValidSwapLocationSuffix("swap123"));
+        repo.updateRepository(records);
+        assertTrue(repo.isValidSwapLocationSuffix("swap123"));
+        repo.close();
+    }
 
     @Test
     public void testResourceClaimsIncremented() throws IOException {
@@ -345,7 +503,7 @@ public class TestWriteAheadFlowFileRepository {
         when(connection.getDestination()).thenReturn(Mockito.mock(Connectable.class));
 
         final FlowFileSwapManager swapMgr = new MockFlowFileSwapManager();
-        final FlowFileQueue queue = new StandardFlowFileQueue("1234", connection, null, null, claimManager, null, swapMgr, null, 10000);
+        final FlowFileQueue queue = new StandardFlowFileQueue("1234", new NopConnectionEventListener(), null, null, claimManager, null, swapMgr, null, 10000, 0L, "0 B");
 
         when(connection.getFlowFileQueue()).thenReturn(queue);
         queueProvider.addConnection(connection);
@@ -361,7 +519,7 @@ public class TestWriteAheadFlowFileRepository {
         // resource claims' counts should be updated for both the swapped out FlowFile and the non-swapped out FlowFile
         try (final WriteAheadFlowFileRepository repo = new WriteAheadFlowFileRepository(NiFiProperties.createBasicNiFiProperties(null, null))) {
             repo.initialize(claimManager);
-            repo.loadFlowFiles(queueProvider, -1L);
+            repo.loadFlowFiles(queueProvider);
 
             // Create a Repository Record that indicates that a FlowFile was created
             final FlowFileRecord flowFile1 = new StandardFlowFileRecord.Builder()
@@ -389,14 +547,14 @@ public class TestWriteAheadFlowFileRepository {
             records.add(rec2);
             repo.updateRepository(records);
 
-            final String swapLocation = swapMgr.swapOut(Collections.singletonList(flowFile2), queue);
+            final String swapLocation = swapMgr.swapOut(Collections.singletonList(flowFile2), queue, null);
             repo.swapFlowFilesOut(Collections.singletonList(flowFile2), queue, swapLocation);
         }
 
         final ResourceClaimManager recoveryClaimManager = new StandardResourceClaimManager();
         try (final WriteAheadFlowFileRepository repo = new WriteAheadFlowFileRepository(NiFiProperties.createBasicNiFiProperties(null, null))) {
             repo.initialize(recoveryClaimManager);
-            final long largestId = repo.loadFlowFiles(queueProvider, 0L);
+            final long largestId = repo.loadFlowFiles(queueProvider);
 
             // largest ID known is 1 because this doesn't take into account the FlowFiles that have been swapped out
             assertEquals(1, largestId);
@@ -429,7 +587,7 @@ public class TestWriteAheadFlowFileRepository {
         repo.initialize(new StandardResourceClaimManager());
 
         final TestQueueProvider queueProvider = new TestQueueProvider();
-        repo.loadFlowFiles(queueProvider, 0L);
+        repo.loadFlowFiles(queueProvider);
 
         final List<FlowFileRecord> flowFileCollection = new ArrayList<>();
 
@@ -481,7 +639,7 @@ public class TestWriteAheadFlowFileRepository {
         // restore
         final WriteAheadFlowFileRepository repo2 = new WriteAheadFlowFileRepository(NiFiProperties.createBasicNiFiProperties(null, null));
         repo2.initialize(new StandardResourceClaimManager());
-        repo2.loadFlowFiles(queueProvider, 0L);
+        repo2.loadFlowFiles(queueProvider);
 
         assertEquals(1, flowFileCollection.size());
         final FlowFileRecord flowFile = flowFileCollection.get(0);
@@ -521,7 +679,7 @@ public class TestWriteAheadFlowFileRepository {
         }
 
         @Override
-        public String swapOut(List<FlowFileRecord> flowFiles, FlowFileQueue flowFileQueue) throws IOException {
+        public String swapOut(List<FlowFileRecord> flowFiles, FlowFileQueue flowFileQueue, final String partitionName) throws IOException {
             Map<String, List<FlowFileRecord>> swapMap = swappedRecords.get(flowFileQueue);
             if (swapMap == null) {
                 swapMap = new HashMap<>();
@@ -558,7 +716,7 @@ public class TestWriteAheadFlowFileRepository {
         }
 
         @Override
-        public List<String> recoverSwapLocations(FlowFileQueue flowFileQueue) throws IOException {
+        public List<String> recoverSwapLocations(FlowFileQueue flowFileQueue, final String partitionName) throws IOException {
             Map<String, List<FlowFileRecord>> swapMap = swappedRecords.get(flowFileQueue);
             if (swapMap == null) {
                 return null;
@@ -606,5 +764,14 @@ public class TestWriteAheadFlowFileRepository {
             this.swappedRecords.clear();
         }
 
+        @Override
+        public Set<String> getSwappedPartitionNames(FlowFileQueue queue) throws IOException {
+            return Collections.emptySet();
+        }
+
+        @Override
+        public String changePartitionName(String swapLocation, String newPartitionName) throws IOException {
+            return swapLocation;
+        }
     }
 }

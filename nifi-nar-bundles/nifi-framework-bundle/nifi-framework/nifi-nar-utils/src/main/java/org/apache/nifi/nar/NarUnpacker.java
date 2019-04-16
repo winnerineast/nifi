@@ -73,6 +73,7 @@ public final class NarUnpacker {
         final Map<File, BundleCoordinate> unpackedNars = new HashMap<>();
 
         try {
+            File unpackedJetty = null;
             File unpackedFramework = null;
             final Set<File> unpackedExtensions = new HashSet<>();
             final List<File> narFiles = new ArrayList<>();
@@ -120,13 +121,19 @@ public final class NarUnpacker {
 
                             // unpack the framework nar
                             unpackedFramework = unpackNar(narFile, frameworkWorkingDir);
+                        } else if (NarClassLoaders.JETTY_NAR_ID.equals(narId)) {
+                            if (unpackedJetty != null) {
+                                throw new IllegalStateException("Multiple Jetty NARs discovered. Only one Jetty NAR is permitted.");
+                            }
+
+                            // unpack and record the Jetty nar
+                            unpackedJetty = unpackNar(narFile, extensionsWorkingDir);
+                            unpackedNars.put(unpackedJetty, new BundleCoordinate(groupId, narId, version));
+                            unpackedExtensions.add(unpackedJetty);
                         } else {
+                            // unpack and record the extension nar
                             final File unpackedExtension = unpackNar(narFile, extensionsWorkingDir);
-
-                            // record the current bundle
                             unpackedNars.put(unpackedExtension, new BundleCoordinate(groupId, narId, version));
-
-                            // unpack the extension nar
                             unpackedExtensions.add(unpackedExtension);
                         }
                     }
@@ -137,6 +144,13 @@ public final class NarUnpacker {
                     throw new IllegalStateException("No framework NAR found.");
                 } else if (!unpackedFramework.canRead()) {
                     throw new IllegalStateException("Framework NAR cannot be read.");
+                }
+
+                // ensure we've found the jetty nar
+                if (unpackedJetty == null) {
+                    throw new IllegalStateException("No Jetty NAR found.");
+                } else if (!unpackedJetty.canRead()) {
+                    throw new IllegalStateException("Jetty NAR cannot be read.");
                 }
 
                 // Determine if any nars no longer exist and delete their working directories. This happens
@@ -196,10 +210,15 @@ public final class NarUnpacker {
             final File unpackedNar = entry.getKey();
             final BundleCoordinate bundleCoordinate = entry.getValue();
 
-            final File bundledDependencies = new File(unpackedNar, "META-INF/bundled-dependencies");
+            final File bundledDependencies = new File(unpackedNar, "NAR-INF/bundled-dependencies");
 
             unpackBundleDocs(docsDirectory, mapping, bundleCoordinate, bundledDependencies);
         }
+    }
+
+    public static void mapExtension(final File unpackedNar, final BundleCoordinate bundleCoordinate, final File docsDirectory, final ExtensionMapping mapping) throws IOException {
+        final File bundledDependencies = new File(unpackedNar, "NAR-INF/bundled-dependencies");
+        unpackBundleDocs(docsDirectory, mapping, bundleCoordinate, bundledDependencies);
     }
 
     private static void unpackBundleDocs(final File docsDirectory, final ExtensionMapping mapping, final BundleCoordinate bundleCoordinate, final File bundledDirectory) throws IOException {
@@ -221,7 +240,7 @@ public final class NarUnpacker {
      * @return the directory to the unpacked NAR
      * @throws IOException if unable to explode nar
      */
-    private static File unpackNar(final File nar, final File baseWorkingDirectory) throws IOException {
+    public static File unpackNar(final File nar, final File baseWorkingDirectory) throws IOException {
         final File narWorkingDirectory = new File(baseWorkingDirectory, nar.getName() + "-unpacked");
 
         // if the working directory doesn't exist, unpack the nar
@@ -262,9 +281,12 @@ public final class NarUnpacker {
             while (jarEntries.hasMoreElements()) {
                 JarEntry jarEntry = jarEntries.nextElement();
                 String name = jarEntry.getName();
+                if(name.contains("META-INF/bundled-dependencies")){
+                    name = name.replace("META-INF/bundled-dependencies", "NAR-INF/bundled-dependencies");
+                }
                 File f = new File(workingDirectory, name);
                 if (jarEntry.isDirectory()) {
-                    FileUtils.ensureDirectoryExistAndCanAccess(f);
+                    FileUtils.ensureDirectoryExistAndCanReadAndWrite(f);
                 } else {
                     makeFile(jarFile.getInputStream(jarEntry), f);
                 }

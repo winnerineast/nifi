@@ -24,6 +24,7 @@ import org.apache.nifi.annotation.behavior.SupportsBatching;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.processor.AbstractProcessor;
@@ -36,6 +37,7 @@ import org.apache.nifi.processor.util.StandardValidators;
 import org.eclipse.jetty.util.StringUtil;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
@@ -53,10 +55,10 @@ public class LogMessage extends AbstractProcessor {
             .name("log-level")
             .displayName("Log Level")
             .required(true)
-            .description("The Log Level to use when logging the message")
-            .allowableValues(MessageLogLevel.values())
+            .description("The Log Level to use when logging the message: " + Arrays.toString(MessageLogLevel.values()))
+            .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .defaultValue(MessageLogLevel.info.toString())
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
     public static final PropertyDescriptor LOG_PREFIX = new PropertyDescriptor.Builder()
@@ -66,7 +68,7 @@ public class LogMessage extends AbstractProcessor {
             .description("Log prefix appended to the log lines. " +
                     "It helps to distinguish the output of multiple LogMessage processors.")
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
     public static final PropertyDescriptor LOG_MESSAGE = new PropertyDescriptor.Builder()
@@ -75,7 +77,7 @@ public class LogMessage extends AbstractProcessor {
             .required(false)
             .description("The log message to emit")
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
     public static final Relationship REL_SUCCESS = new Relationship.Builder()
@@ -120,7 +122,12 @@ public class LogMessage extends AbstractProcessor {
     @Override
     public void onTrigger(final ProcessContext context, final ProcessSession session) {
 
-        final String logLevelValue = context.getProperty(LOG_LEVEL).getValue().toLowerCase();
+        final FlowFile flowFile = session.get();
+        if (flowFile == null) {
+            return;
+        }
+
+        final String logLevelValue = context.getProperty(LOG_LEVEL).evaluateAttributeExpressions(flowFile).getValue().toLowerCase();
 
         final MessageLogLevel logLevel;
         try {
@@ -149,17 +156,9 @@ public class LogMessage extends AbstractProcessor {
                 break;
         }
 
-        if (!isLogLevelEnabled) {
-            transferChunk(session);
-            return;
+        if (isLogLevelEnabled) {
+            processFlowFile(logger, logLevel, flowFile, context);
         }
-
-        final FlowFile flowFile = session.get();
-        if (flowFile == null) {
-            return;
-        }
-
-        processFlowFile(logger, logLevel, flowFile, context);
         session.transfer(flowFile, REL_SUCCESS);
     }
 
@@ -200,12 +199,4 @@ public class LogMessage extends AbstractProcessor {
                 logger.debug(messageToWrite);
         }
     }
-
-    private void transferChunk(final ProcessSession session) {
-        final List<FlowFile> flowFiles = session.get(CHUNK_SIZE);
-        if (!flowFiles.isEmpty()) {
-            session.transfer(flowFiles, REL_SUCCESS);
-        }
-    }
-
 }

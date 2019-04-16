@@ -18,9 +18,11 @@ package org.apache.nifi.processors.rethinkdb;
 
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.annotation.lifecycle.OnStopped;
+import org.apache.nifi.components.AllowableValue;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.expression.AttributeExpression.ResultType;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.processor.AbstractProcessor;
-import org.apache.nifi.processor.DataUnit;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.util.StandardValidators;
@@ -39,7 +41,7 @@ abstract class AbstractRethinkDBProcessor extends AbstractProcessor {
             .description("Specifies the character set of the document data.")
             .required(true)
             .defaultValue("UTF-8")
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(StandardValidators.CHARACTER_SET_VALIDATOR)
             .build();
 
@@ -103,6 +105,30 @@ abstract class AbstractRethinkDBProcessor extends AbstractProcessor {
             .addValidator(StandardValidators.DATA_SIZE_VALIDATOR)
             .build();
 
+    public static final PropertyDescriptor RETHINKDB_DOCUMENT_ID = new PropertyDescriptor.Builder()
+                .displayName("Document Identifier")
+                .name("rethinkdb-document-identifier")
+                .description("A FlowFile attribute, or attribute expression used " +
+                    "for determining RethinkDB key for the Flow File content")
+                .required(true)
+                .addValidator(StandardValidators.createAttributeExpressionLanguageValidator(ResultType.STRING, true))
+                .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+                .build();
+
+    public static AllowableValue DURABILITY_SOFT = new AllowableValue("soft", "Soft", "Don't save changes to disk before ack");
+
+    public static AllowableValue DURABILITY_HARD = new AllowableValue("hard", "Hard", "Save change to disk before ack");
+
+    protected static final PropertyDescriptor DURABILITY = new PropertyDescriptor.Builder()
+                .name("rethinkdb-durability")
+                .displayName("Durablity of documents")
+                .description("Durability of documents being inserted")
+                .required(true)
+                .defaultValue("hard")
+                .allowableValues(DURABILITY_HARD, DURABILITY_SOFT)
+                .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+                .build();
+
     static final Relationship REL_SUCCESS = new Relationship.Builder().name("success")
             .description("Sucessful FlowFiles are routed to this relationship").build();
 
@@ -122,7 +148,10 @@ abstract class AbstractRethinkDBProcessor extends AbstractProcessor {
     public static final String RESULT_FIRST_ERROR_KEY = "first_error";
     public static final String RESULT_WARNINGS_KEY = "warnings";
 
+    public static final String DURABILITY_OPTION_KEY = "durability";
+
     public static final String RETHINKDB_ERROR_MESSAGE = "rethinkdb.error.message";
+    public static final String DOCUMENT_ID_EMPTY_MESSAGE = "Document Id cannot be empty";
 
     protected Connection rethinkDbConnection;
     protected String databaseName;
@@ -156,7 +185,6 @@ abstract class AbstractRethinkDBProcessor extends AbstractProcessor {
         password = context.getProperty(PASSWORD).getValue();
         databaseName = context.getProperty(DB_NAME).getValue();
         tableName = context.getProperty(TABLE_NAME).getValue();
-        maxDocumentsSize = context.getProperty(MAX_DOCUMENTS_SIZE).asDataSize(DataUnit.B).longValue();
 
         try {
             rethinkDbConnection = makeConnection();

@@ -16,15 +16,19 @@
  */
 package org.apache.nifi.attribute.expression.language;
 
-import static java.lang.Double.NEGATIVE_INFINITY;
-import static java.lang.Double.NaN;
-import static java.lang.Double.POSITIVE_INFINITY;
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-import static org.hamcrest.Matchers.greaterThan;
-import static org.hamcrest.MatcherAssert.assertThat;
-import static org.junit.Assert.fail;
+import org.antlr.runtime.tree.Tree;
+import org.apache.nifi.attribute.expression.language.Query.Range;
+import org.apache.nifi.attribute.expression.language.evaluation.NumberQueryResult;
+import org.apache.nifi.attribute.expression.language.evaluation.QueryResult;
+import org.apache.nifi.attribute.expression.language.exception.AttributeExpressionLanguageException;
+import org.apache.nifi.attribute.expression.language.exception.AttributeExpressionLanguageParsingException;
+import org.apache.nifi.expression.AttributeExpression.ResultType;
+import org.apache.nifi.flowfile.FlowFile;
+import org.apache.nifi.registry.VariableRegistry;
+import org.junit.Assert;
+import org.junit.Ignore;
+import org.junit.Test;
+import org.mockito.Mockito;
 
 import java.io.BufferedInputStream;
 import java.io.IOException;
@@ -40,22 +44,15 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
-import org.apache.nifi.attribute.expression.language.Query.Range;
-import org.apache.nifi.attribute.expression.language.evaluation.NumberQueryResult;
-import org.apache.nifi.attribute.expression.language.evaluation.QueryResult;
-import org.apache.nifi.attribute.expression.language.exception.AttributeExpressionLanguageException;
-import org.apache.nifi.attribute.expression.language.exception.AttributeExpressionLanguageParsingException;
-import org.apache.nifi.expression.AttributeExpression.ResultType;
-import org.apache.nifi.flowfile.FlowFile;
-import org.antlr.runtime.tree.Tree;
-
-import org.apache.nifi.registry.VariableRegistry;
-import org.junit.Assert;
-
-import org.junit.Ignore;
-import org.junit.Test;
-
-import org.mockito.Mockito;
+import static java.lang.Double.NEGATIVE_INFINITY;
+import static java.lang.Double.NaN;
+import static java.lang.Double.POSITIVE_INFINITY;
+import static org.hamcrest.MatcherAssert.assertThat;
+import static org.hamcrest.Matchers.greaterThan;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public class TestQuery {
 
@@ -75,6 +72,21 @@ public class TestQuery {
         assertValid("${getStateValue('the_count')}");
         // left here because it's convenient for looking at the output
         //System.out.println(Query.compile("").evaluate(null));
+    }
+
+    @Test
+    public void testPrepareWithEscapeChar() {
+        final Map<String, String> variables = Collections.singletonMap("foo", "bar");
+
+        assertEquals("bar${foo}$bar", Query.prepare("${foo}$${foo}$$${foo}").evaluateExpressions(variables, null));
+
+        final PreparedQuery onlyEscapedQuery = Query.prepare("$${foo}");
+        final String onlyEscapedEvaluated = onlyEscapedQuery.evaluateExpressions(variables, null);
+        assertEquals("${foo}", onlyEscapedEvaluated);
+
+        final PreparedQuery mixedQuery = Query.prepare("${foo}$${foo}");
+        final String mixedEvaluated = mixedQuery.evaluateExpressions(variables, null);
+        assertEquals("bar${foo}", mixedEvaluated);
     }
 
     private void assertValid(final String query) {
@@ -155,14 +167,33 @@ public class TestQuery {
     @Test
     public void testEscape() {
         final Map<String, String> attributes = new HashMap<>();
-        attributes.put("attr", "My Value");
-        attributes.put("${xx}", "hello");
+        attributes.put("abc", "xyz");
+        attributes.put("xyz", "hello");
+        attributes.put("$xyz", "good-bye");
+        attributes.put("${abc}", "good-bye");
 
-        assertEquals("My Value", evaluateQueryForEscape("${attr}", attributes));
-        assertEquals("${attr}", evaluateQueryForEscape("$${attr}", attributes));
-        assertEquals("$My Value", evaluateQueryForEscape("$$${attr}", attributes));
-        assertEquals("$${attr}", evaluateQueryForEscape("$$$${attr}", attributes));
-        assertEquals("$$My Value", evaluateQueryForEscape("$$$$${attr}", attributes));
+        assertEquals("$$xyz", evaluateQueryForEscape("$$$$${abc}", attributes));
+        assertEquals("xyz", evaluateQueryForEscape("${abc}", attributes));
+        assertEquals("${abc}", evaluateQueryForEscape("$${abc}", attributes));
+        assertEquals("$xyz", evaluateQueryForEscape("$$${abc}", attributes));
+        assertEquals("$${abc}", evaluateQueryForEscape("$$$${abc}", attributes));
+
+        assertEquals( "Unescaped $$${5 because no closing brace", evaluateQueryForEscape("Unescaped $$${5 because no closing brace", attributes));
+        assertEquals( "Unescaped $ because no closing brace", evaluateQueryForEscape("Unescaped $$${'5'} because no closing brace", attributes));
+
+        assertEquals("I owe you $5", evaluateQueryForEscape("I owe you $5", attributes));
+        assertEquals("You owe me $$5 too", evaluateQueryForEscape("You owe me $$5 too", attributes));
+        assertEquals("Unescaped $$${5 because no closing brace", evaluateQueryForEscape("Unescaped $$${5 because no closing brace", attributes));
+        assertEquals("xyz owes me $5", evaluateQueryForEscape("${abc} owes me $5", attributes));
+        assertEquals("xyz owes me ${5", evaluateQueryForEscape("${abc} owes me ${5", attributes));
+        assertEquals("xyz owes me ", evaluateQueryForEscape("${abc} owes me ${'5'}", attributes));
+        assertEquals("xyz owes me $", evaluateQueryForEscape("${abc} owes me $$${'5'}", attributes));
+
+        assertEquals("SNAP$$$$$$$$$", evaluateQueryForEscape("${literal('SNAP$$$$$$$$$')}", attributes));
+        assertEquals("SNAP$$", evaluateQueryForEscape("${literal('SNAP$$')}", attributes));
+        assertEquals("hello", evaluateQueryForEscape("${${abc}}", attributes));
+        assertEquals("good-bye", evaluateQueryForEscape("${'$$${abc}'}", attributes));
+        assertEquals("good-bye", evaluateQueryForEscape("${'$xyz'}", attributes));
     }
 
     @Test
@@ -304,7 +335,7 @@ public class TestQuery {
 
     @Test(expected = AttributeExpressionLanguageException.class)
     public void testCannotCombineWithNonReducingFunction() {
-        Query.compileTree("${allAttributes( 'a.1' ):plus(1)}");
+        Query.compile("${allAttributes( 'a.1' ):plus(1)}");
     }
 
     @Test
@@ -357,6 +388,7 @@ public class TestQuery {
         assertEquals("Val", evaluateQueryForEscape("${attr:replaceAll(\"My (Val)ue{1,2}\", '$1')}", attributes));
     }
 
+    @SuppressWarnings("unchecked")
     private String evaluateQueryForEscape(final String queryString, final Map<String, String> attributes) {
         final FlowFile mockFlowFile = Mockito.mock(FlowFile.class);
         Mockito.when(mockFlowFile.getAttributes()).thenReturn(attributes);
@@ -639,7 +671,7 @@ public class TestQuery {
         final String query = "${ abc:equals('abc'):or( \n\t${xx:isNull()}\n) }";
         assertEquals(ResultType.BOOLEAN, Query.getResultType(query));
         Query.validateExpression(query, false);
-        assertEquals("true", Query.evaluateExpressions(query, Collections.EMPTY_MAP));
+        assertEquals("true", Query.evaluateExpressions(query, Collections.emptyMap()));
     }
 
     @Test
@@ -964,6 +996,42 @@ public class TestQuery {
     }
 
     @Test
+    public void testNestedAnyDelineatedValueOr() {
+        final Map<String, String> attributes = new HashMap<>();
+        attributes.put("abc", "a,b,c");
+        attributes.put("xyz", "x");
+
+        // Assert each part separately.
+        assertEquals("true", Query.evaluateExpressions("${anyDelineatedValue('${abc}', ','):equals('c')}",
+                attributes, null));
+        assertEquals("false", Query.evaluateExpressions("${anyDelineatedValue('${xyz}', ','):equals('z')}",
+                attributes, null));
+
+        // Combine them with 'or'.
+        assertEquals("true", Query.evaluateExpressions(
+                "${anyDelineatedValue('${abc}', ','):equals('c'):or(${anyDelineatedValue('${xyz}', ','):equals('z')})}",
+                attributes, null));
+    }
+
+    @Test
+    public void testNestedAnyDelineatedValueAnd() {
+        final Map<String, String> attributes = new HashMap<>();
+        attributes.put("abc", "2,0,1,3");
+        attributes.put("xyz", "x,y,z");
+
+        // Assert each part separately.
+        assertEquals("true", Query.evaluateExpressions("${anyDelineatedValue('${abc}', ','):gt('2')}",
+                attributes, null));
+        assertEquals("true", Query.evaluateExpressions("${anyDelineatedValue('${xyz}', ','):equals('z')}",
+                attributes, null));
+
+        // Combine them with 'and'.
+        assertEquals("true", Query.evaluateExpressions(
+                "${anyDelineatedValue('${abc}', ','):gt('2'):and(${anyDelineatedValue('${xyz}', ','):equals('z')})}",
+                attributes, null));
+    }
+
+    @Test
     public void testAllDelineatedValues() {
         final Map<String, String> attributes = new HashMap<>();
         attributes.put("abc", "a,b,c");
@@ -980,6 +1048,37 @@ public class TestQuery {
         verifyEquals("${allDelineatedValues(${abc}, ','):matches('[abc]')}", attributes, true);
         verifyEquals("${allDelineatedValues(${abc}, ','):matches('[abd]')}", attributes, false);
         verifyEquals("${allDelineatedValues(${abc}, ','):equals('a'):not()}", attributes, false);
+    }
+
+    @Test
+    public void testAllDelineatedValuesCount() {
+        final Map<String, String> attributes = new HashMap<>();
+
+        final String query = "${allDelineatedValues('${test}', '/'):count()}";
+
+        attributes.put("test", "/my/path");
+        assertEquals(ResultType.WHOLE_NUMBER, Query.getResultType(query));
+        assertEquals("3", Query.evaluateExpressions(query, attributes, null));
+        assertEquals("", Query.evaluateExpressions("${test:getDelimitedField(1, '/')}", attributes, null));
+        assertEquals("my", Query.evaluateExpressions("${test:getDelimitedField(2, '/')}", attributes, null));
+        assertEquals("path", Query.evaluateExpressions("${test:getDelimitedField(3, '/')}", attributes, null));
+
+        attributes.put("test", "this/is/my/path");
+        assertEquals(ResultType.WHOLE_NUMBER, Query.getResultType(query));
+        assertEquals("4", Query.evaluateExpressions(query, attributes, null));
+        assertEquals("this", Query.evaluateExpressions("${test:getDelimitedField(1, '/')}", attributes, null));
+        assertEquals("is", Query.evaluateExpressions("${test:getDelimitedField(2, '/')}", attributes, null));
+        assertEquals("my", Query.evaluateExpressions("${test:getDelimitedField(3, '/')}", attributes, null));
+        assertEquals("path", Query.evaluateExpressions("${test:getDelimitedField(4, '/')}", attributes, null));
+
+        attributes.put("test", "/");
+        assertEquals(ResultType.WHOLE_NUMBER, Query.getResultType(query));
+        assertEquals("0", Query.evaluateExpressions(query, attributes, null));
+
+        attributes.put("test", "path/");
+        assertEquals(ResultType.WHOLE_NUMBER, Query.getResultType(query));
+        assertEquals("1", Query.evaluateExpressions(query, attributes, null));
+        assertEquals("path", Query.evaluateExpressions("${test:getDelimitedField(1, '/')}", attributes, null));
     }
 
     @Test
@@ -1225,6 +1324,9 @@ public class TestQuery {
         assertEquals("false", secondEvaluation);
 
         verifyEquals("${dotted:matches('abc\\.xyz')}", attributes, true);
+
+        // Test for matches(null)
+        assertEquals("false", Query.evaluateExpressions("${abc:matches(${not.here})}", attributes, null));
     }
 
     @Test
@@ -1245,6 +1347,9 @@ public class TestQuery {
         assertEquals("false", secondEvaluation);
 
         verifyEquals("${dotted:find('\\.')}", attributes, true);
+
+        // Test for find(null)
+        assertEquals("false", Query.evaluateExpressions("${abc:find(${not.here})}", attributes, null));
     }
 
     @Test
@@ -1675,25 +1780,25 @@ public class TestQuery {
         verifyEquals("${string:escapeHtml4()}", attributes, "special &clubs;");
       }
 
-      @Test
-      public void testUnescapeFunctions() {
-          final Map<String, String> attributes = new HashMap<>();
+    @Test
+    public void testUnescapeFunctions() {
+        final Map<String, String> attributes = new HashMap<>();
 
-          attributes.put("string", "making air \\\"QUOTES\\\".");
-          verifyEquals("${string:unescapeJson()}", attributes, "making air \"QUOTES\".");
+        attributes.put("string", "making air \\\"QUOTES\\\".");
+        verifyEquals("${string:unescapeJson()}", attributes, "making air \"QUOTES\".");
 
-          attributes.put("string", "M &amp; M");
-          verifyEquals("${string:unescapeXml()}", attributes, "M & M");
+        attributes.put("string", "M &amp; M");
+        verifyEquals("${string:unescapeXml()}", attributes, "M & M");
 
-          attributes.put("string", "\"making air \"\"QUOTES\"\".\"");
-          verifyEquals("${string:unescapeCsv()}", attributes, "making air \"QUOTES\".");
+        attributes.put("string", "\"making air \"\"QUOTES\"\".\"");
+        verifyEquals("${string:unescapeCsv()}", attributes, "making air \"QUOTES\".");
 
-          attributes.put("string", "special &iexcl;");
-          verifyEquals("${string:unescapeHtml3()}", attributes, "special ¡");
+        attributes.put("string", "special &iexcl;");
+        verifyEquals("${string:unescapeHtml3()}", attributes, "special ¡");
 
-          attributes.put("string", "special &clubs;");
-          verifyEquals("${string:unescapeHtml4()}", attributes, "special ♣");
-        }
+        attributes.put("string", "special &clubs;");
+        verifyEquals("${string:unescapeHtml4()}", attributes, "special ♣");
+    }
 
     @Test
     public void testIfElse() {
@@ -1709,7 +1814,12 @@ public class TestQuery {
         verifyEquals("${attr2:isNull():ifElse('a', 'b')}", attributes, "a");
         verifyEquals("${literal(true):ifElse('a', 'b')}", attributes, "a");
         verifyEquals("${literal(true):ifElse(false, 'b')}", attributes, "false");
+    }
 
+    @Test
+    public void testThread() {
+        final Map<String, String> attributes = new HashMap<>();
+        verifyEquals("${thread()}", attributes, "main");
     }
 
     private void verifyEquals(final String expression, final Map<String, String> attributes, final Object expectedResult) {

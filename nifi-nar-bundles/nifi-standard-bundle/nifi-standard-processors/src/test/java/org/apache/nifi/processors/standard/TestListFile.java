@@ -17,10 +17,22 @@
 
 package org.apache.nifi.processors.standard;
 
-
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.assertTrue;
+import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.state.Scope;
+import org.apache.nifi.flowfile.FlowFile;
+import org.apache.nifi.flowfile.attributes.CoreAttributes;
+import org.apache.nifi.processor.ProcessContext;
+import org.apache.nifi.processor.util.list.AbstractListProcessor;
+import org.apache.nifi.processor.util.list.ListProcessorTestWatcher;
+import org.apache.nifi.processors.standard.util.FileInfo;
+import org.apache.nifi.util.MockFlowFile;
+import org.apache.nifi.util.TestRunner;
+import org.apache.nifi.util.TestRunners;
+import org.junit.Before;
+import org.junit.Ignore;
+import org.junit.Rule;
+import org.junit.Test;
+import org.junit.runner.Description;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -28,56 +40,81 @@ import java.io.IOException;
 import java.nio.file.FileStore;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Set;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiPredicate;
 import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
-import org.apache.nifi.components.PropertyDescriptor;
-import org.apache.nifi.flowfile.attributes.CoreAttributes;
-import org.apache.nifi.processor.ProcessContext;
-import org.apache.nifi.processor.Relationship;
-import org.apache.nifi.processor.util.list.AbstractListProcessor;
-import org.apache.nifi.util.MockFlowFile;
-import org.apache.nifi.util.TestRunner;
-import org.apache.nifi.util.TestRunners;
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 public class TestListFile {
 
-    final String TESTDIR = "target/test/data/in";
-    final File testDir = new File(TESTDIR);
-    ListFile processor;
-    TestRunner runner;
-    ProcessContext context;
+    private final String TESTDIR = "target/test/data/in";
+    private final File testDir = new File(TESTDIR);
+    private ListFile processor;
+    private TestRunner runner;
+    private ProcessContext context;
 
     // Testing factors in milliseconds for file ages that are configured on each run by resetAges()
     // age#millis are relative time references
     // time#millis are absolute time references
     // age#filter are filter label strings for the filter properties
-    Long syncTime = System.currentTimeMillis();
-    Long time0millis, time1millis, time2millis, time3millis, time4millis, time5millis;
-    Long age0millis, age1millis, age2millis, age3millis, age4millis, age5millis;
-    String age0, age1, age2, age3, age4, age5;
+    private Long syncTime = getTestModifiedTime();
+    private Long time0millis, time1millis, time2millis, time3millis, time4millis, time5millis;
+    private Long age0millis, age1millis, age2millis, age3millis, age4millis, age5millis;
+    private String age0, age1, age2, age3, age4, age5;
 
-    static final long DEFAULT_SLEEP_MILLIS = TimeUnit.NANOSECONDS.toMillis(AbstractListProcessor.LISTING_LAG_NANOS * 2);
+    @Rule
+    public ListProcessorTestWatcher dumpState = new ListProcessorTestWatcher(
+            () -> {
+                try {
+                    return runner.getStateManager().getState(Scope.LOCAL).toMap();
+                } catch (IOException e) {
+                    throw new RuntimeException("Failed to retrieve state", e);
+                }
+            },
+            () -> listFiles(testDir).stream()
+                    .map(f -> new FileInfo.Builder().filename(f.getName()).lastModifiedTime(f.lastModified()).build()).collect(Collectors.toList()),
+            () -> runner.getFlowFilesForRelationship(AbstractListProcessor.REL_SUCCESS).stream().map(m -> (FlowFile) m).collect(Collectors.toList())
+    ) {
+        @Override
+        protected void finished(Description description) {
+            try {
+                // In order to refer files in testDir, we want to execute this rule before tearDown, because tearDown removes files.
+                // And @After is always executed before @Rule.
+                tearDown();
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to tearDown.", e);
+            }
+        }
+    };
 
     @Before
     public void setUp() throws Exception {
         processor = new ListFile();
         runner = TestRunners.newTestRunner(processor);
+        runner.setProperty(AbstractListProcessor.TARGET_SYSTEM_TIMESTAMP_PRECISION, AbstractListProcessor.PRECISION_SECONDS.getValue());
         context = runner.getProcessContext();
         deleteDirectory(testDir);
         assertTrue("Unable to create test data directory " + testDir.getAbsolutePath(), testDir.exists() || testDir.mkdirs());
         resetAges();
     }
 
-    @After
     public void tearDown() throws Exception {
         deleteDirectory(testDir);
         File tempFile = processor.getPersistenceFile();
@@ -91,22 +128,132 @@ public class TestListFile {
         }
     }
 
+    private List<File> listFiles(final File file) {
+        if (file.isDirectory()) {
+            final List<File> result = new ArrayList<>();
+            Optional.ofNullable(file.listFiles()).ifPresent(files -> Arrays.stream(files).forEach(f -> result.addAll(listFiles(f))));
+            return result;
+        } else {
+            return Collections.singletonList(file);
+        }
+    }
+
     /**
      * This method ensures runner clears transfer state,
-     * and sleeps the current thread for DEFAULT_SLEEP_MILLIS before executing runner.run().
+     * and sleeps the current thread for specific period defined at {@link AbstractListProcessor#LISTING_LAG_MILLIS}
+     * based on local filesystem timestamp precision before executing runner.run().
      */
     private void runNext() throws InterruptedException {
         runner.clearTransferState();
-        Thread.sleep(DEFAULT_SLEEP_MILLIS);
+
+        final List<File> files = listFiles(testDir);
+        final boolean isMillisecondSupported = files.stream().anyMatch(file -> file.lastModified() % 1_000 > 0);
+        final Long lagMillis;
+        if (isMillisecondSupported) {
+            lagMillis = AbstractListProcessor.LISTING_LAG_MILLIS.get(TimeUnit.MILLISECONDS);
+        } else {
+            // Filesystems such as Mac OS X HFS (Hierarchical File System) or EXT3 are known that only support timestamp in seconds precision.
+            lagMillis = AbstractListProcessor.LISTING_LAG_MILLIS.get(TimeUnit.SECONDS);
+        }
+        Thread.sleep(lagMillis * 2);
+
+        final long startedAtMillis = System.currentTimeMillis();
         runner.run();
+        dumpState.dumpState(startedAtMillis);
     }
 
+
     @Test
-    public void testGetRelationships() throws Exception {
-        Set<Relationship> relationships = processor.getRelationships();
-        assertEquals(1, relationships.size());
-        assertEquals(AbstractListProcessor.REL_SUCCESS, relationships.toArray()[0]);
+    @Ignore("Intended only for manual testing, as is very expensive to run as a unit test. Performs listing of 1,000,000 files (doesn't actually create the files, though - injects them in) to " +
+        "ensure performance is not harmed")
+    public void testPerformanceOnLargeListing() {
+        final List<Path> paths = new ArrayList<>(1_000_000);
+        final File base = new File("target");
+
+        for (int firstLevel=0; firstLevel < 1000; firstLevel++) {
+            final File dir = new File(base, String.valueOf(firstLevel));
+
+            for (int secondLevel = 0; secondLevel < 1000; secondLevel++) {
+                final File file = new File(dir, String.valueOf(secondLevel));
+                paths.add(file.toPath());
+            }
+        }
+
+        final BasicFileAttributes basicFileAttributes = new BasicFileAttributes() {
+            @Override
+            public FileTime lastModifiedTime() {
+                return FileTime.fromMillis(System.currentTimeMillis());
+            }
+
+            @Override
+            public FileTime lastAccessTime() {
+                return FileTime.fromMillis(System.currentTimeMillis());
+            }
+
+            @Override
+            public FileTime creationTime() {
+                return FileTime.fromMillis(System.currentTimeMillis());
+            }
+
+            @Override
+            public boolean isRegularFile() {
+                return false;
+            }
+
+            @Override
+            public boolean isDirectory() {
+                return false;
+            }
+
+            @Override
+            public boolean isSymbolicLink() {
+                return false;
+            }
+
+            @Override
+            public boolean isOther() {
+                return false;
+            }
+
+            @Override
+            public long size() {
+                return 0;
+            }
+
+            @Override
+            public Object fileKey() {
+                return null;
+            }
+        };
+
+        processor = new ListFile() {
+            @Override
+            protected Stream<Path> getPathStream(final Path basePath, final int maxDepth, final BiPredicate<Path, BasicFileAttributes> matcher) throws IOException {
+                return paths.stream()
+                    .filter(path -> matcher.test(path, basicFileAttributes));
+            }
+        };
+
+        runner = TestRunners.newTestRunner(processor);
+        runner.setProperty(AbstractListProcessor.TARGET_SYSTEM_TIMESTAMP_PRECISION, AbstractListProcessor.PRECISION_SECONDS.getValue());
+        runner.setProperty(ListFile.TRACK_PERFORMANCE, "true");
+        runner.setProperty(ListFile.MAX_TRACKED_FILES, "100000");
+        runner.setProperty(ListFile.DIRECTORY, "target");
+
+        runner.run();
+
+        final ListFile.PerformanceTracker tracker = processor.getPerformanceTracker();
+        assertEquals(100_000, tracker.getTrackedFileCount());
+
+        final ListFile.MonitorActiveTasks monitorActiveTasks = new ListFile.MonitorActiveTasks(tracker, runner.getLogger(), 1000, 1000, 1);
+
+        while (tracker.getTrackedFileCount() > 0) {
+            monitorActiveTasks.run();
+        }
+
+        assertEquals(0, tracker.getTrackedFileCount());
     }
+
 
     @Test
     public void testGetPath() {
@@ -305,7 +452,7 @@ public class TestListFile {
 
     @Test
     public void testFilterHidden() throws Exception {
-        final long now = TimeUnit.MILLISECONDS.convert(System.nanoTime(), TimeUnit.NANOSECONDS);
+        final long now = getTestModifiedTime();
 
         FileOutputStream fos;
 
@@ -388,7 +535,7 @@ public class TestListFile {
 
     @Test
     public void testFilterPathPattern() throws Exception {
-        final long now = TimeUnit.MILLISECONDS.convert(System.nanoTime(), TimeUnit.NANOSECONDS);
+        final long now = getTestModifiedTime();
 
         final File subdir1 = new File(TESTDIR + "/subdir1");
         assertTrue(subdir1.mkdirs());
@@ -577,16 +724,54 @@ public class TestListFile {
 
     @Test
     public void testIsListingResetNecessary() throws Exception {
-        assertEquals(true, processor.isListingResetNecessary(ListFile.DIRECTORY));
-        assertEquals(true, processor.isListingResetNecessary(ListFile.RECURSE));
-        assertEquals(true, processor.isListingResetNecessary(ListFile.FILE_FILTER));
-        assertEquals(true, processor.isListingResetNecessary(ListFile.PATH_FILTER));
-        assertEquals(true, processor.isListingResetNecessary(ListFile.MIN_AGE));
-        assertEquals(true, processor.isListingResetNecessary(ListFile.MAX_AGE));
-        assertEquals(true, processor.isListingResetNecessary(ListFile.MIN_SIZE));
-        assertEquals(true, processor.isListingResetNecessary(ListFile.MAX_SIZE));
+        assertTrue(processor.isListingResetNecessary(ListFile.DIRECTORY));
+        assertTrue(processor.isListingResetNecessary(ListFile.RECURSE));
+        assertTrue(processor.isListingResetNecessary(ListFile.FILE_FILTER));
+        assertTrue(processor.isListingResetNecessary(ListFile.PATH_FILTER));
+        assertTrue(processor.isListingResetNecessary(ListFile.MIN_AGE));
+        assertTrue(processor.isListingResetNecessary(ListFile.MAX_AGE));
+        assertTrue(processor.isListingResetNecessary(ListFile.MIN_SIZE));
+        assertTrue(processor.isListingResetNecessary(ListFile.MAX_SIZE));
         assertEquals(true, processor.isListingResetNecessary(ListFile.IGNORE_HIDDEN_FILES));
         assertEquals(false, processor.isListingResetNecessary(new PropertyDescriptor.Builder().name("x").build()));
+    }
+
+    private void makeTestFile(final String name, final long millis, final Map<String, Long> fileTimes) throws IOException {
+        final File file = new File(TESTDIR + name);
+        assertTrue(file.createNewFile());
+        assertTrue(file.setLastModified(millis));
+        fileTimes.put(file.getName(), file.lastModified());
+    }
+
+    @Test
+    public void testFilterRunMidFileWrites() throws Exception {
+        final Map<String, Long> fileTimes = new HashMap<>();
+
+        runner.setProperty(ListFile.DIRECTORY, testDir.getAbsolutePath());
+
+        makeTestFile("/batch1-age3.txt", time3millis, fileTimes);
+        makeTestFile("/batch1-age4.txt", time4millis, fileTimes);
+        makeTestFile("/batch1-age5.txt", time5millis, fileTimes);
+
+        // check files
+        runNext();
+
+        runner.assertAllFlowFilesTransferred(ListFile.REL_SUCCESS);
+        runner.assertTransferCount(ListFile.REL_SUCCESS, 3);
+        assertEquals(3, runner.getFlowFilesForRelationship(ListFile.REL_SUCCESS).size());
+
+        // should be picked since it's newer than age3
+        makeTestFile("/batch2-age2.txt", time2millis, fileTimes);
+        // should be picked even if it has the same age3 timestamp, because it wasn't there at the previous cycle.
+        makeTestFile("/batch2-age3.txt", time3millis, fileTimes);
+        // should be ignored since it's older than age3
+        makeTestFile("/batch2-age4.txt", time4millis, fileTimes);
+
+        runNext();
+
+        runner.assertAllFlowFilesTransferred(ListFile.REL_SUCCESS);
+        runner.assertTransferCount(ListFile.REL_SUCCESS, 2);
+        assertEquals(2, runner.getFlowFilesForRelationship(ListFile.REL_SUCCESS).size());
     }
 
     /*
@@ -595,20 +780,20 @@ public class TestListFile {
      * Provides "now" minus 1 second in millis
     */
     private static long getTestModifiedTime() {
-        final long nowNanos = System.nanoTime();
+        final long nowMillis = System.currentTimeMillis();
         // Subtract a second to avoid possible rounding issues
-        final long nowSeconds = TimeUnit.SECONDS.convert(nowNanos, TimeUnit.NANOSECONDS) - 1;
+        final long nowSeconds = TimeUnit.SECONDS.convert(nowMillis, TimeUnit.MILLISECONDS) - 1;
         return TimeUnit.MILLISECONDS.convert(nowSeconds, TimeUnit.SECONDS);
     }
 
-    public void resetAges() {
-        syncTime = System.currentTimeMillis();
+    private void resetAges() {
+        syncTime = getTestModifiedTime();
 
         age0millis = 0L;
-        age1millis = 2000L;
-        age2millis = 5000L;
-        age3millis = 7000L;
-        age4millis = 10000L;
+        age1millis = 5000L;
+        age2millis = 10000L;
+        age3millis = 15000L;
+        age4millis = 20000L;
         age5millis = 100000L;
 
         time0millis = syncTime - age0millis;

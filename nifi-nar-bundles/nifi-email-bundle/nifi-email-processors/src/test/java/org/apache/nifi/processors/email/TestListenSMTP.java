@@ -28,6 +28,7 @@ import org.apache.commons.mail.EmailException;
 import org.apache.commons.mail.SimpleEmail;
 import org.apache.nifi.remote.io.socket.NetworkUtils;
 import org.apache.nifi.ssl.SSLContextService;
+import org.apache.nifi.ssl.StandardRestrictedSSLContextService;
 import org.apache.nifi.ssl.StandardSSLContextService;
 import org.apache.nifi.util.TestRunner;
 import org.apache.nifi.util.TestRunners;
@@ -91,8 +92,8 @@ public class TestListenSMTP {
     @Test
     public void validateSuccessfulInteractionWithTls() throws Exception, EmailException {
         System.setProperty("mail.smtp.ssl.trust", "*");
-        System.setProperty("javax.net.ssl.keyStore", "src/test/resources/localhost-ks.jks");
-        System.setProperty("javax.net.ssl.keyStorePassword", "localtest");
+        System.setProperty("javax.net.ssl.keyStore", "src/test/resources/keystore.jks");
+        System.setProperty("javax.net.ssl.keyStorePassword", "passwordpassword");
         int port = NetworkUtils.availablePort();
 
         TestRunner runner = TestRunners.newTestRunner(ListenSMTP.class);
@@ -100,13 +101,13 @@ public class TestListenSMTP {
         runner.setProperty(ListenSMTP.SMTP_MAXIMUM_CONNECTIONS, "3");
 
         // Setup the SSL Context
-        SSLContextService sslContextService = new StandardSSLContextService();
+        SSLContextService sslContextService = new StandardRestrictedSSLContextService();
         runner.addControllerService("ssl-context", sslContextService);
-        runner.setProperty(sslContextService, StandardSSLContextService.TRUSTSTORE, "src/test/resources/localhost-ts.jks");
-        runner.setProperty(sslContextService, StandardSSLContextService.TRUSTSTORE_PASSWORD, "localtest");
+        runner.setProperty(sslContextService, StandardSSLContextService.TRUSTSTORE, "src/test/resources/truststore.jks");
+        runner.setProperty(sslContextService, StandardSSLContextService.TRUSTSTORE_PASSWORD, "passwordpassword");
         runner.setProperty(sslContextService, StandardSSLContextService.TRUSTSTORE_TYPE, "JKS");
-        runner.setProperty(sslContextService, StandardSSLContextService.KEYSTORE, "src/test/resources/localhost-ks.jks");
-        runner.setProperty(sslContextService, StandardSSLContextService.KEYSTORE_PASSWORD, "localtest");
+        runner.setProperty(sslContextService, StandardSSLContextService.KEYSTORE, "src/test/resources/keystore.jks");
+        runner.setProperty(sslContextService, StandardSSLContextService.KEYSTORE_PASSWORD, "passwordpassword");
         runner.setProperty(sslContextService, StandardSSLContextService.KEYSTORE_TYPE, "JKS");
         runner.enableControllerService(sslContextService);
 

@@ -17,14 +17,34 @@
 
 package org.apache.nifi.serialization.record;
 
-import java.util.Date;
-import java.util.Optional;
-
 import org.apache.nifi.serialization.record.util.IllegalTypeConversionException;
+
+import java.util.Date;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
 
 public interface Record {
 
     RecordSchema getSchema();
+
+    /**
+     * Indicates whether or not field values for this record are expected to be coerced into the type designated by the schema.
+     * If <code>true</code>, then it is safe to assume that calling {@link #getValue(RecordField)} will return an Object of the appropriate
+     * type according to the schema, or an object that can be coerced into the appropriate type. If type checking
+     * is not enabled, then calling {@link #getValue(RecordField)} can return an object of any type.
+     *
+     * @return <code>true</code> if type checking is enabled, <code>false</code> otherwise.
+     */
+    boolean isTypeChecked();
+
+    /**
+     * If <code>true</code>, any field that is added to the record will be drop unless the field is known by the schema
+     *
+     * @return <code>true</code> if fields that are unknown to the schema will be dropped, <code>false</code>
+     *         if all field values are retained.
+     */
+    boolean isDropUnknownFields();
 
     /**
      * Updates the Record's schema to to incorporate all of the fields in the given schema. If both schemas have a
@@ -34,8 +54,8 @@ public interface Record {
      * default value is <code>null</code>. Note that all values for this Record will still be valid according
      * to this Record's Schema after this operation completes, as no type will be changed except to become more
      * lenient. However, if incorporating the other schema does modify this schema, then the schema text
-     * returned by {@link #getSchemaText()}, the schema format returned by {@link #getSchemaFormat()}, and
-     * the SchemaIdentifier returned by {@link #getIdentifier()} for this record's schema may all become Empty.
+     * returned by {@link RecordSchema#getSchemaText() getSchemaText()}, the schema format returned by {@link RecordSchema#getSchemaFormat() getSchemaFormat()}, and
+     * the SchemaIdentifier returned by {@link RecordSchema#getIdentifier() getIdentifier()} for this record's schema may all become Empty.
      *
      * @param other the other schema to incorporate into this Record's schema
      *
@@ -44,8 +64,18 @@ public interface Record {
     void incorporateSchema(RecordSchema other);
 
     /**
+     * Updates the Record's schema to incorporate all of the fields that were added via the {@link #setValue(RecordField, Object)}
+     * method that did not exist in the schema.
+     *
+     * @throws UnsupportedOperationException if this record does not support incorporating other fields
+     */
+    void incorporateInactiveFields();
+
+    /**
      * <p>
-     * Returns a view of the the values of the fields in this Record.
+     * Returns a view of the the values of the fields in this Record. Note that this method returns values only for
+     * those entries in the Record's schema. This allows the Record to guarantee that it will return the values in
+     * the order dictated by the schema.
      * </p>
      *
      * <b>NOTE:</b> The array that is returned may be an underlying array that is backing
@@ -99,6 +129,20 @@ public interface Record {
     void setValue(String fieldName, Object value);
 
     /**
+     * Updates the value of the given field to the given value. If the field specified is not present in this Record's schema,
+     * this method will track of the field as an 'inactive field', which can then be added into the Record's schema via the
+     * {@link #incorporateInactiveFields} method. This method should not be called after each invocation of {@link #setValue(RecordField, Object)}
+     * but rather should be called only once all updates to the Record have completed, in order to optimize performance.
+     *
+     * If this method changes any value in the Record, any {@link SerializedForm} that was provided will be removed (i.e., any
+     * subsequent call to {@link #getSerializedForm()}} will return an empty Optional).
+     *
+     * @param field the field to update
+     * @param value the value to set
+     */
+    void setValue(RecordField field, Object value);
+
+    /**
      * Updates the value of a the specified index of a field. If the field specified
      * is not present in this Record's schema, this method will do nothing. If the field specified
      * is not an Array, an IllegalArgumentException will be thrown. If the field specified is an array
@@ -134,4 +178,19 @@ public interface Record {
      *             name is not a Map
      */
     void setMapValue(String fieldName, String mapKey, Object value);
+
+    /**
+     * Returns a Set that contains the names of all of the fields that are present in the Record, regardless of
+     * whether or not those fields are contained in the schema. To determine which fields exist in the Schema, use
+     * {@link #getSchema()}.{@link RecordSchema#getFieldNames() getFieldNames()} instead.
+     *
+     * @return a Set that contains the names of all of the fields that are present in the Record
+     */
+    Set<String> getRawFieldNames();
+
+    /**
+     * Converts the Record into a Map whose keys are the same as the Record's field names and the values are the field values
+     * @return a Map that represents the values in the Record.
+     */
+    Map<String, Object> toMap();
 }

@@ -113,7 +113,7 @@ public class ControllerServiceLoader {
         for (final Element serviceElement : serviceElements) {
             final ControllerServiceNode serviceNode = createControllerService(controller, serviceElement, encryptor);
             if (parentGroup == null) {
-                controller.addRootControllerService(serviceNode);
+                controller.getFlowManager().addRootControllerService(serviceNode);
             } else {
                 parentGroup.addControllerService(serviceNode);
             }
@@ -146,26 +146,36 @@ public class ControllerServiceLoader {
                 final ControllerServiceState state = ControllerServiceState.valueOf(dto.getState());
                 if (state == ControllerServiceState.ENABLED) {
                     nodesToEnable.add(node);
+                    logger.debug("Will enable Controller Service {}", node);
+                } else {
+                    logger.debug("Will not enable Controller Service {} because its state is set to {}", node, state);
                 }
             }
 
             enableControllerServices(nodesToEnable, controller, autoResumeState);
+        } else {
+            logger.debug("Will not enable the following Controller Services because 'auto-resume state' flag is false: {}", nodeMap.keySet());
         }
     }
 
     public static void enableControllerServices(final Collection<ControllerServiceNode> nodesToEnable, final FlowController controller, final boolean autoResumeState) {
         // Start services
         if (autoResumeState) {
-            controller.enableControllerServices(nodesToEnable);
+            logger.debug("Enabling Controller Services {}", nodesToEnable);
+            nodesToEnable.forEach(ControllerServiceNode::performValidation); // validate services before attempting to enable them
+
+            controller.getControllerServiceProvider().enableControllerServices(nodesToEnable);
+        } else {
+            logger.debug("Will not enable the following Controller Services because 'auto-resume state' flag is false: {}", nodesToEnable);
         }
     }
 
-    public static ControllerServiceNode cloneControllerService(final ControllerServiceProvider provider, final ControllerServiceNode controllerService) {
+    public static ControllerServiceNode cloneControllerService(final FlowController flowController, final ControllerServiceNode controllerService) {
         // create a new id for the clone seeded from the original id so that it is consistent in a cluster
         final UUID id = UUID.nameUUIDFromBytes(controllerService.getIdentifier().getBytes(StandardCharsets.UTF_8));
 
-        final ControllerServiceNode clone = provider.createControllerService(controllerService.getCanonicalClassName(), id.toString(),
-                controllerService.getBundleCoordinate(), Collections.emptySet(), false);
+        final ControllerServiceNode clone = flowController.getFlowManager().createControllerService(controllerService.getCanonicalClassName(), id.toString(),
+                controllerService.getBundleCoordinate(), Collections.emptySet(), false, true);
         clone.setName(controllerService.getName());
         clone.setComments(controllerService.getComments());
 
@@ -180,12 +190,12 @@ public class ControllerServiceLoader {
         return clone;
     }
 
-    private static ControllerServiceNode createControllerService(final ControllerServiceProvider provider, final Element controllerServiceElement, final StringEncryptor encryptor) {
+    private static ControllerServiceNode createControllerService(final FlowController flowController, final Element controllerServiceElement, final StringEncryptor encryptor) {
         final ControllerServiceDTO dto = FlowFromDOMFactory.getControllerService(controllerServiceElement, encryptor);
 
         BundleCoordinate coordinate;
         try {
-            coordinate = BundleUtils.getCompatibleBundle(dto.getType(), dto.getBundle());
+            coordinate = BundleUtils.getCompatibleBundle(flowController.getExtensionManager(), dto.getType(), dto.getBundle());
         } catch (final IllegalStateException e) {
             final BundleDTO bundleDTO = dto.getBundle();
             if (bundleDTO == null) {
@@ -195,16 +205,22 @@ public class ControllerServiceLoader {
             }
         }
 
-        final ControllerServiceNode node = provider.createControllerService(dto.getType(), dto.getId(), coordinate, Collections.emptySet(), false);
+        final ControllerServiceNode node = flowController.getFlowManager().createControllerService(dto.getType(), dto.getId(), coordinate, Collections.emptySet(), false, true);
         node.setName(dto.getName());
         node.setComments(dto.getComments());
+        node.setVersionedComponentId(dto.getVersionedComponentId());
         return node;
     }
 
     private static void configureControllerService(final ControllerServiceNode node, final Element controllerServiceElement, final StringEncryptor encryptor) {
         final ControllerServiceDTO dto = FlowFromDOMFactory.getControllerService(controllerServiceElement, encryptor);
-        node.setAnnotationData(dto.getAnnotationData());
-        node.setProperties(dto.getProperties());
+        node.pauseValidationTrigger();
+        try {
+            node.setAnnotationData(dto.getAnnotationData());
+            node.setProperties(dto.getProperties());
+        } finally {
+            node.resumeValidationTrigger();
+        }
     }
 
 }

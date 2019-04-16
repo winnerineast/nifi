@@ -17,9 +17,9 @@
 
 package org.apache.nifi.schema.access;
 
-import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.schemaregistry.services.SchemaRegistry;
 import org.apache.nifi.serialization.record.RecordSchema;
+import org.apache.nifi.serialization.record.SchemaIdentifier;
 import org.apache.nifi.stream.io.StreamUtils;
 
 import java.io.IOException;
@@ -27,6 +27,7 @@ import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 
 public class HortonworksEncodedSchemaReferenceStrategy implements SchemaAccessStrategy {
@@ -45,7 +46,7 @@ public class HortonworksEncodedSchemaReferenceStrategy implements SchemaAccessSt
     }
 
     @Override
-    public RecordSchema getSchema(final FlowFile flowFile, final InputStream contentStream, final RecordSchema readSchema) throws SchemaNotFoundException, IOException {
+    public RecordSchema getSchema(final Map<String, String> variables, final InputStream contentStream, final RecordSchema readSchema) throws SchemaNotFoundException, IOException {
         final byte[] buffer = new byte[13];
         try {
             StreamUtils.fillBuffer(contentStream, buffer);
@@ -66,7 +67,8 @@ public class HortonworksEncodedSchemaReferenceStrategy implements SchemaAccessSt
         final long schemaId = bb.getLong();
         final int schemaVersion = bb.getInt();
 
-        return schemaRegistry.retrieveSchema(schemaId, schemaVersion);
+        final SchemaIdentifier schemaIdentifier = SchemaIdentifier.builder().id(schemaId).version(schemaVersion).build();
+        return schemaRegistry.retrieveSchema(schemaIdentifier);
     }
 
     @Override

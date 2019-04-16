@@ -36,8 +36,6 @@ import org.apache.nifi.util.NiFiProperties;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import javax.xml.bind.JAXBContext;
-import javax.xml.bind.Unmarshaller;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -62,17 +60,6 @@ public class ClusterProtocolHeartbeatMonitor extends AbstractHeartbeatMonitor im
     private final ConcurrentMap<NodeIdentifier, NodeHeartbeat> heartbeatMessages = new ConcurrentHashMap<>();
 
     private volatile long purgeTimestamp = System.currentTimeMillis();
-
-    protected static final Unmarshaller nodeIdentifierUnmarshaller;
-
-    static {
-        try {
-            final JAXBContext jaxbContext = JAXBContext.newInstance(NodeIdentifier.class);
-            nodeIdentifierUnmarshaller = jaxbContext.createUnmarshaller();
-        } catch (final Exception e) {
-            throw new RuntimeException("Failed to create an Unmarshaller for unmarshalling Node Identifier", e);
-        }
-    }
 
     public ClusterProtocolHeartbeatMonitor(final ClusterCoordinator clusterCoordinator, final ProtocolListener protocolListener, final NiFiProperties nifiProperties) {
         super(clusterCoordinator, nifiProperties);
@@ -148,7 +135,7 @@ public class ClusterProtocolHeartbeatMonitor extends AbstractHeartbeatMonitor im
     }
 
     @Override
-    public ProtocolMessage handle(final ProtocolMessage msg) throws ProtocolException {
+    public ProtocolMessage handle(final ProtocolMessage msg, Set<String> nodeIds) throws ProtocolException {
         switch (msg.getType()) {
             case HEARTBEAT:
                 return handleHeartbeat((HeartbeatMessage) msg);

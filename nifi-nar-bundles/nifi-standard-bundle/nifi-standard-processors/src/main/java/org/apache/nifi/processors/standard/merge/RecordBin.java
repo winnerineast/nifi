@@ -17,6 +17,19 @@
 
 package org.apache.nifi.processors.standard.merge;
 
+import org.apache.nifi.flowfile.FlowFile;
+import org.apache.nifi.flowfile.attributes.CoreAttributes;
+import org.apache.nifi.logging.ComponentLog;
+import org.apache.nifi.processor.ProcessContext;
+import org.apache.nifi.processor.ProcessSession;
+import org.apache.nifi.processors.standard.MergeRecord;
+import org.apache.nifi.serialization.RecordReader;
+import org.apache.nifi.serialization.RecordSetWriter;
+import org.apache.nifi.serialization.RecordSetWriterFactory;
+import org.apache.nifi.serialization.WriteResult;
+import org.apache.nifi.serialization.record.Record;
+import org.apache.nifi.stream.io.ByteCountingOutputStream;
+
 import java.io.IOException;
 import java.io.OutputStream;
 import java.util.ArrayList;
@@ -32,24 +45,7 @@ import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 
-import org.apache.nifi.flowfile.FlowFile;
-import org.apache.nifi.flowfile.attributes.CoreAttributes;
-import org.apache.nifi.logging.ComponentLog;
-import org.apache.nifi.processor.ProcessContext;
-import org.apache.nifi.processor.ProcessSession;
-import org.apache.nifi.processors.standard.MergeRecord;
-import org.apache.nifi.schema.access.SchemaNotFoundException;
-import org.apache.nifi.serialization.MalformedRecordException;
-import org.apache.nifi.serialization.RecordReader;
-import org.apache.nifi.serialization.RecordSetWriter;
-import org.apache.nifi.serialization.RecordSetWriterFactory;
-import org.apache.nifi.serialization.WriteResult;
-import org.apache.nifi.serialization.record.Record;
-import org.apache.nifi.stream.io.ByteCountingOutputStream;
-
 public class RecordBin {
-    public static final String MERGE_COUNT_ATTRIBUTE = "merge.count";
-    public static final String MERGE_BIN_AGE_ATTRIBUTE = "merge.bin.age";
 
     private final ComponentLog logger;
     private final ProcessSession session;
@@ -67,10 +63,13 @@ public class RecordBin {
     private RecordSetWriter recordWriter;
     private ByteCountingOutputStream out;
     private int recordCount = 0;
+    private int fragmentCount = 0;
     private volatile boolean complete = false;
 
     private static final AtomicLong idGenerator = new AtomicLong(0L);
     private final long id = idGenerator.getAndIncrement();
+
+    private volatile int requiredRecordCount = -1;
 
 
     public RecordBin(final ProcessContext context, final ProcessSession session, final ComponentLog logger, final RecordBinThresholds thresholds) {
@@ -96,9 +95,7 @@ public class RecordBin {
         return complete;
     }
 
-    public boolean offer(final FlowFile flowFile, final RecordReader recordReader, final ProcessSession flowFileSession, final boolean block)
-        throws IOException, MalformedRecordException, SchemaNotFoundException {
-
+    public boolean offer(final FlowFile flowFile, final RecordReader recordReader, final ProcessSession flowFileSession, final boolean block) throws IOException {
         if (isComplete()) {
             logger.debug("RecordBin.offer for id={} returning false because {} is complete", new Object[] {flowFile.getId(), this});
             return false;
@@ -118,7 +115,7 @@ public class RecordBin {
         }
 
         boolean flowFileMigrated = false;
-
+        this.fragmentCount++;
         try {
             if (isComplete()) {
                 logger.debug("RecordBin.offer for id={} returning false because {} is complete", new Object[] {flowFile.getId(), this});
@@ -135,7 +132,7 @@ public class RecordBin {
 
                     this.out = new ByteCountingOutputStream(rawOut);
 
-                    recordWriter = writerFactory.createWriter(logger, record.getSchema(), flowFile, out);
+                    recordWriter = writerFactory.createWriter(logger, record.getSchema(), out);
                     recordWriter.beginRecordSet();
                 }
 
@@ -150,6 +147,12 @@ public class RecordBin {
             flowFileSession.migrate(this.session, Collections.singleton(flowFile));
             flowFileMigrated = true;
             this.flowFiles.add(flowFile);
+
+            if (recordCount >= getMinimumRecordCount()) {
+                // If we have met our minimum record count, we need to flush so that when we reach the desired number of bytes
+                // the bin is considered 'full enough'.
+                recordWriter.flush();
+            }
 
             if (isFull()) {
                 logger.debug(this + " is now full. Completing bin.");
@@ -200,26 +203,7 @@ public class RecordBin {
                 return false;
             }
 
-            int maxRecords;
-            final Optional<String> recordCountAttribute = thresholds.getRecordCountAttribute();
-            if (recordCountAttribute.isPresent()) {
-                final Optional<String> recordCountValue = flowFiles.stream()
-                    .filter(ff -> ff.getAttribute(recordCountAttribute.get()) != null)
-                    .map(ff -> ff.getAttribute(recordCountAttribute.get()))
-                    .findFirst();
-
-                if (!recordCountValue.isPresent()) {
-                    return false;
-                }
-
-                try {
-                    maxRecords = Integer.parseInt(recordCountValue.get());
-                } catch (final NumberFormatException e) {
-                    maxRecords = 1;
-                }
-            } else {
-                maxRecords = thresholds.getMaxRecords();
-            }
+            int maxRecords = thresholds.getMaxRecords();
 
             if (recordCount >= maxRecords) {
                 return true;
@@ -229,10 +213,38 @@ public class RecordBin {
                 return true;
             }
 
+            Optional<String> fragmentCountAttribute = thresholds.getFragmentCountAttribute();
+            if(fragmentCountAttribute != null && fragmentCountAttribute.isPresent()) {
+                final Optional<String> fragmentCountValue = flowFiles.stream()
+                        .filter(ff -> ff.getAttribute(fragmentCountAttribute.get()) != null)
+                        .map(ff -> ff.getAttribute(fragmentCountAttribute.get()))
+                        .findFirst();
+                if (fragmentCountValue.isPresent()) {
+                    try {
+                        int expectedFragments = Integer.parseInt(fragmentCountValue.get());
+                        if (this.fragmentCount == expectedFragments)
+                            return true;
+                    } catch (NumberFormatException nfe) {
+                        this.logger.error(nfe.getMessage(), nfe);
+                    }
+                }
+            }
             return false;
         } finally {
             readLock.unlock();
         }
+    }
+
+    private int getMinimumRecordCount() {
+        final int currentCount = requiredRecordCount;
+        if (currentCount > -1) {
+            return currentCount;
+        }
+
+        int requiredCount = thresholds.getMinRecords();
+
+        this.requiredRecordCount = requiredCount;
+        return requiredCount;
     }
 
     public boolean isFullEnough() {
@@ -242,19 +254,7 @@ public class RecordBin {
                 return false;
             }
 
-            int requiredRecordCount;
-            final Optional<String> recordCountAttribute = thresholds.getRecordCountAttribute();
-            if (recordCountAttribute.isPresent()) {
-                final String recordCountValue = flowFiles.get(0).getAttribute(recordCountAttribute.get());
-                try {
-                    requiredRecordCount = Integer.parseInt(recordCountValue);
-                } catch (final NumberFormatException e) {
-                    requiredRecordCount = 1;
-                }
-            } else {
-                requiredRecordCount = thresholds.getMinRecords();
-            }
-
+            final int requiredRecordCount = getMinimumRecordCount();
             return (recordCount >= requiredRecordCount && out.getBytesWritten() >= thresholds.getMinBytes());
         } finally {
             readLock.unlock();
@@ -334,7 +334,7 @@ public class RecordBin {
             }
 
             // If using defragment mode, and we don't have enough FlowFiles, then we need to fail this bin.
-            final Optional<String> countAttr = thresholds.getRecordCountAttribute();
+            final Optional<String> countAttr = thresholds.getFragmentCountAttribute();
             if (countAttr.isPresent()) {
                 // Ensure that at least one FlowFile has a fragment.count attribute and that they all have the same value, if they have a value.
                 Integer expectedBinCount = null;
@@ -389,10 +389,11 @@ public class RecordBin {
             attributes.putAll(writeResult.getAttributes());
             attributes.put("record.count", String.valueOf(writeResult.getRecordCount()));
             attributes.put(CoreAttributes.MIME_TYPE.key(), recordWriter.getMimeType());
-            attributes.put(MERGE_COUNT_ATTRIBUTE, Integer.toString(flowFiles.size()));
-            attributes.put(MERGE_BIN_AGE_ATTRIBUTE, Long.toString(getBinAge()));
+            attributes.put(MergeRecord.MERGE_COUNT_ATTRIBUTE, Integer.toString(flowFiles.size()));
+            attributes.put(MergeRecord.MERGE_BIN_AGE_ATTRIBUTE, Long.toString(getBinAge()));
 
             merged = session.putAllAttributes(merged, attributes);
+            flowFiles.forEach(ff -> session.putAttribute(ff, MergeRecord.MERGE_UUID_ATTRIBUTE, merged.getAttribute(CoreAttributes.UUID.key())));
 
             session.getProvenanceReporter().join(flowFiles, merged, "Records Merged due to: " + completionReason);
             session.transfer(merged, MergeRecord.REL_MERGED);

@@ -17,20 +17,16 @@
 
 package org.apache.nifi.schemaregistry.hortonworks;
 
-import static org.junit.Assert.assertNotNull;
-import static org.mockito.Matchers.any;
-import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.mock;
-
-import java.lang.reflect.Constructor;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.util.HashMap;
-import java.util.Map;
-
+import com.hortonworks.registries.schemaregistry.SchemaCompatibility;
+import com.hortonworks.registries.schemaregistry.SchemaMetadata;
+import com.hortonworks.registries.schemaregistry.SchemaMetadataInfo;
+import com.hortonworks.registries.schemaregistry.SchemaVersionInfo;
+import com.hortonworks.registries.schemaregistry.client.SchemaRegistryClient;
+import com.hortonworks.registries.schemaregistry.errors.SchemaNotFoundException;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.controller.ConfigurationContext;
 import org.apache.nifi.serialization.record.RecordSchema;
+import org.apache.nifi.serialization.record.SchemaIdentifier;
 import org.apache.nifi.util.MockConfigurationContext;
 import org.junit.Before;
 import org.junit.Ignore;
@@ -39,12 +35,16 @@ import org.mockito.Mockito;
 import org.mockito.invocation.InvocationOnMock;
 import org.mockito.stubbing.Answer;
 
-import com.hortonworks.registries.schemaregistry.SchemaCompatibility;
-import com.hortonworks.registries.schemaregistry.SchemaMetadata;
-import com.hortonworks.registries.schemaregistry.SchemaMetadataInfo;
-import com.hortonworks.registries.schemaregistry.SchemaVersionInfo;
-import com.hortonworks.registries.schemaregistry.client.SchemaRegistryClient;
-import com.hortonworks.registries.schemaregistry.errors.SchemaNotFoundException;
+import java.lang.reflect.Constructor;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.util.HashMap;
+import java.util.Map;
+
+import static org.junit.Assert.assertNotNull;
+import static org.mockito.Matchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
 
 public class TestHortonworksSchemaRegistry {
     private HortonworksSchemaRegistry registry;
@@ -98,7 +98,7 @@ public class TestHortonworksSchemaRegistry {
     @Test
     public void testCacheUsed() throws Exception {
         final String text = new String(Files.readAllBytes(Paths.get("src/test/resources/empty-schema.avsc")));
-        final SchemaVersionInfo info = new SchemaVersionInfo(1, text, 2L, "description");
+        final SchemaVersionInfo info = new SchemaVersionInfo(1L, "unit-test", 2, text, System.currentTimeMillis(), "description");
         schemaVersionInfoMap.put("unit-test", info);
 
         final SchemaMetadata metadata = new SchemaMetadata.Builder("unit-test")
@@ -124,7 +124,8 @@ public class TestHortonworksSchemaRegistry {
         registry.enable(configurationContext);
 
         for (int i = 0; i < 10000; i++) {
-            final RecordSchema schema = registry.retrieveSchema("unit-test");
+            final SchemaIdentifier schemaIdentifier = SchemaIdentifier.builder().name("unit-test").build();
+            final RecordSchema schema = registry.retrieveSchema(schemaIdentifier);
             assertNotNull(schema);
         }
 
@@ -135,7 +136,7 @@ public class TestHortonworksSchemaRegistry {
     @Ignore("This can be useful for manual testing/debugging, but will keep ignored for now because we don't want automated builds to run this, since it depends on timing")
     public void testCacheExpires() throws Exception {
         final String text = new String(Files.readAllBytes(Paths.get("src/test/resources/empty-schema.avsc")));
-        final SchemaVersionInfo info = new SchemaVersionInfo(1, text, 2L, "description");
+        final SchemaVersionInfo info = new SchemaVersionInfo(1L, "unit-test", 2,  text, System.currentTimeMillis(), "description");
         schemaVersionInfoMap.put("unit-test", info);
 
         final SchemaMetadata metadata = new SchemaMetadata.Builder("unit-test")
@@ -161,7 +162,8 @@ public class TestHortonworksSchemaRegistry {
         registry.enable(configurationContext);
 
         for (int i = 0; i < 2; i++) {
-            final RecordSchema schema = registry.retrieveSchema("unit-test");
+            final SchemaIdentifier schemaIdentifier = SchemaIdentifier.builder().name("unit-test").build();
+            final RecordSchema schema = registry.retrieveSchema(schemaIdentifier);
             assertNotNull(schema);
         }
 
@@ -170,7 +172,8 @@ public class TestHortonworksSchemaRegistry {
         Thread.sleep(2000L);
 
         for (int i = 0; i < 2; i++) {
-            final RecordSchema schema = registry.retrieveSchema("unit-test");
+            final SchemaIdentifier schemaIdentifier = SchemaIdentifier.builder().name("unit-test").build();
+            final RecordSchema schema = registry.retrieveSchema(schemaIdentifier);
             assertNotNull(schema);
         }
 

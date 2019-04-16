@@ -17,6 +17,7 @@
 package org.apache.nifi.script;
 
 import org.apache.nifi.controller.ConfigurationContext;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.logging.ComponentLog;
 
 import java.io.File;
@@ -69,6 +70,7 @@ public class ScriptingComponentHelper {
     private String scriptBody;
     private String[] modules;
     private List<PropertyDescriptor> descriptors;
+    private List<AllowableValue> engineAllowableValues;
 
     public BlockingQueue<ScriptEngine> engineQ = null;
 
@@ -108,6 +110,10 @@ public class ScriptingComponentHelper {
         return descriptors;
     }
 
+    public List<AllowableValue> getScriptEngineAllowableValues() {
+        return engineAllowableValues;
+    }
+
     public void setDescriptors(List<PropertyDescriptor> descriptors) {
         this.descriptors = descriptors;
     }
@@ -126,8 +132,8 @@ public class ScriptingComponentHelper {
         // Verify that exactly one of "script file" or "script body" is set
         Map<PropertyDescriptor, String> propertyMap = validationContext.getProperties();
         if (StringUtils.isEmpty(propertyMap.get(ScriptingComponentUtils.SCRIPT_FILE)) == StringUtils.isEmpty(propertyMap.get(ScriptingComponentUtils.SCRIPT_BODY))) {
-            results.add(new ValidationResult.Builder().valid(false).explanation(
-                    "Exactly one of Script File or Script Body must be set").build());
+            results.add(new ValidationResult.Builder().subject("Script Body or Script File").valid(false).explanation(
+                    "exactly one of Script File or Script Body must be set").build());
         }
 
         return results;
@@ -166,6 +172,7 @@ public class ScriptingComponentHelper {
                 return o1.getValue().compareTo(o2.getValue());
             });
 
+            engineAllowableValues = engineList;
             AllowableValue[] engines = engineList.toArray(new AllowableValue[engineList.size()]);
 
             SCRIPT_ENGINE = new PropertyDescriptor.Builder()
@@ -175,7 +182,7 @@ public class ScriptingComponentHelper {
                     .allowableValues(engines)
                     .defaultValue(engines[0].getValue())
                     .required(true)
-                    .expressionLanguageSupported(false)
+                    .expressionLanguageSupported(ExpressionLanguageScope.NONE)
                     .build();
             descriptors.add(SCRIPT_ENGINE);
         }

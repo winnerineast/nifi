@@ -16,6 +16,15 @@
  */
 package org.apache.nifi.processor.util;
 
+import org.apache.nifi.components.PropertyValue;
+import org.apache.nifi.components.ValidationContext;
+import org.apache.nifi.components.ValidationResult;
+import org.apache.nifi.components.Validator;
+import org.apache.nifi.expression.AttributeExpression.ResultType;
+import org.apache.nifi.flowfile.FlowFile;
+import org.apache.nifi.processor.DataUnit;
+import org.apache.nifi.util.FormatUtils;
+
 import java.io.File;
 import java.net.MalformedURLException;
 import java.net.URI;
@@ -27,17 +36,9 @@ import java.text.ParseException;
 import java.time.Instant;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
-
-import org.apache.nifi.components.PropertyValue;
-import org.apache.nifi.components.ValidationContext;
-import org.apache.nifi.components.ValidationResult;
-import org.apache.nifi.components.Validator;
-import org.apache.nifi.expression.AttributeExpression.ResultType;
-import org.apache.nifi.flowfile.FlowFile;
-import org.apache.nifi.processor.DataUnit;
-import org.apache.nifi.util.FormatUtils;
 
 public class StandardValidators {
 
@@ -340,6 +341,36 @@ public class StandardValidators {
     };
 
     /**
+     * This validator will evaluate an expression using ONLY environment and variable registry properties,
+     * then validate that the result is a supported character set.
+     */
+    public static final Validator CHARACTER_SET_VALIDATOR_WITH_EVALUATION = new Validator() {
+        @Override
+        public ValidationResult validate(final String subject, final String input, final ValidationContext context) {
+            String evaluatedInput = input;
+            if (context.isExpressionLanguageSupported(subject) && context.isExpressionLanguagePresent(input)) {
+                try {
+                    PropertyValue propertyValue = context.newPropertyValue(input);
+                    evaluatedInput = (propertyValue == null) ? input : propertyValue.evaluateAttributeExpressions().getValue();
+                } catch (final Exception e) {
+                    return new ValidationResult.Builder().subject(subject).input(input).explanation("Not a valid expression").valid(false).build();
+                }
+            }
+
+            String reason = null;
+            try {
+                if (!Charset.isSupported(evaluatedInput)) {
+                    reason = "Character Set is not supported by this JVM.";
+                }
+            } catch (final IllegalArgumentException iae) {
+                reason = "Character Set value is null or is not supported by this JVM.";
+            }
+
+            return new ValidationResult.Builder().subject(subject).input(evaluatedInput).explanation(reason).valid(reason == null).build();
+        }
+    };
+
+    /**
      * URL Validator that does not allow the Expression Language to be used
      */
     public static final Validator URL_VALIDATOR = createURLValidator();
@@ -358,6 +389,24 @@ public class StandardValidators {
                 return new ValidationResult.Builder().subject(subject).input(input).explanation("Not a valid URI").valid(false).build();
             }
         }
+    };
+
+    public static final Validator URI_LIST_VALIDATOR = (subject, input, context) -> {
+
+        if (context.isExpressionLanguageSupported(subject) && context.isExpressionLanguagePresent(input)) {
+            return new ValidationResult.Builder().subject(subject).input(input).explanation("Expression Language Present").valid(true).build();
+        }
+
+        if (input == null || input.isEmpty()) {
+            return new ValidationResult.Builder().subject(subject).input(input).explanation("Not a valid URI, value is missing or empty").valid(false).build();
+        }
+
+        Optional<ValidationResult> invalidUri = Arrays.stream(input.split(","))
+                .filter(uri -> uri != null && !uri.trim().isEmpty())
+                .map(String::trim)
+                .map((uri) -> StandardValidators.URI_VALIDATOR.validate(subject,uri,context)).filter((uri) -> !uri.isValid()).findFirst();
+
+        return invalidUri.orElseGet(() -> new ValidationResult.Builder().subject(subject).input(input).explanation("Valid URI(s)").valid(true).build());
     };
 
     public static final Validator REGULAR_EXPRESSION_VALIDATOR = createRegexValidator(0, Integer.MAX_VALUE, false);

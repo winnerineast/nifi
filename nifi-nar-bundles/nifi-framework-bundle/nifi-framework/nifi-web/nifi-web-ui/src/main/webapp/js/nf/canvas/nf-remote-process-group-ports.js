@@ -24,12 +24,13 @@
                 'nf.ErrorHandler',
                 'nf.Common',
                 'nf.Dialog',
+                'nf.Storage',
                 'nf.Client',
                 'nf.CanvasUtils',
                 'nf.ng.Bridge',
                 'nf.RemoteProcessGroup'],
-            function ($, d3, nfErrorHandler, nfCommon, nfDialog, nfClient, nfCanvasUtils, nfNgBridge, nfRemoteProcessGroup) {
-                return (nf.RemoteProcessGroupPorts = factory($, d3, nfErrorHandler, nfCommon, nfDialog, nfClient, nfCanvasUtils, nfNgBridge, nfRemoteProcessGroup));
+            function ($, d3, nfErrorHandler, nfCommon, nfDialog, nfStorage, nfClient, nfCanvasUtils, nfNgBridge, nfRemoteProcessGroup) {
+                return (nf.RemoteProcessGroupPorts = factory($, d3, nfErrorHandler, nfCommon, nfDialog, nfStorage, nfClient, nfCanvasUtils, nfNgBridge, nfRemoteProcessGroup));
             });
     } else if (typeof exports === 'object' && typeof module === 'object') {
         module.exports = (nf.RemoteProcessGroupPorts =
@@ -38,6 +39,7 @@
                 require('nf.ErrorHandler'),
                 require('nf.Common'),
                 require('nf.Dialog'),
+                require('nf.Storage'),
                 require('nf.Client'),
                 require('nf.CanvasUtils'),
                 require('nf.ng.Bridge'),
@@ -48,12 +50,13 @@
             root.nf.ErrorHandler,
             root.nf.Common,
             root.nf.Dialog,
+            root.nf.Storage,
             root.nf.Client,
             root.nf.CanvasUtils,
             root.nf.ng.Bridge,
             root.nf.RemoteProcessGroup);
     }
-}(this, function ($, d3, nfErrorHandler, nfCommon, nfDialog, nfClient, nfCanvasUtils, nfNgBridge, nfRemoteProcessGroup) {
+}(this, function ($, d3, nfErrorHandler, nfCommon, nfDialog, nfStorage, nfClient, nfCanvasUtils, nfNgBridge, nfRemoteProcessGroup) {
     'use strict';
 
     /**
@@ -93,6 +96,7 @@
                             // create the remote process group details
                             var remoteProcessGroupPortEntity = {
                                 'revision': nfClient.getRevision(remoteProcessGroupData),
+                                'disconnectedNodeAcknowledged': nfStorage.isDisconnectionAcknowledged(),
                                 'remoteProcessGroupPort': {
                                     id: remotePortId,
                                     groupId: remoteProcessGroupId,
@@ -295,8 +299,8 @@
         var remoteProcessGroupId = $('#remote-process-group-ports-id').text();
         var remoteProcessGroup = d3.select('#id-' + remoteProcessGroupId);
 
-        // if can modify, support updating the remote group port
-        if (nfCanvasUtils.canModify(remoteProcessGroup)) {
+        // if can operate, support updating the remote group port transmission status
+        if (nfCanvasUtils.canOperate(remoteProcessGroup)) {
 
             var createTransmissionSwitch = function (port) {
                 var transmissionSwitch;
@@ -326,33 +330,35 @@
             var transmissionSwitch = createTransmissionSwitch(port);
             transmissionSwitch.appendTo(portContainerEditContainer);
 
-            // only support configuration when the remote port exists
-            if (port.exists === true && port.connected === true) {
-                // create the button for editing the ports configuration
-                var editRemotePort = $('<button class="button edit-remote-port fa fa-pencil"></button>').click(function () {
-                    var portName = $('#' + portId + '-name').text();
-                    var portConcurrentTasks = $('#' + portId + '-concurrent-tasks').text();
-                    var portCompression = $('#' + portId + '-compression').text() === 'Yes';
-                    var batchCount = $('#' + portId + '-batch-count').text();
-                    var batchSize = $('#' + portId + '-batch-size').text();
-                    var batchDuration = $('#' + portId + '-batch-duration').text();
+            // only support configuration when the remote port exists and if can modify
+            if (nfCanvasUtils.canModify(remoteProcessGroup)) {
+                if (port.exists === true && port.connected === true) {
+                    // create the button for editing the ports configuration
+                    var editRemotePort = $('<button class="button edit-remote-port fa fa-pencil"></button>').click(function () {
+                        var portName = $('#' + portId + '-name').text();
+                        var portConcurrentTasks = $('#' + portId + '-concurrent-tasks').text();
+                        var portCompression = $('#' + portId + '-compression').text() === 'Yes';
+                        var batchCount = $('#' + portId + '-batch-count').text();
+                        var batchSize = $('#' + portId + '-batch-size').text();
+                        var batchDuration = $('#' + portId + '-batch-duration').text();
 
-                    // show the configuration dialog
-                    configureRemotePort(port.id, portName, portConcurrentTasks, portCompression, batchCount, batchSize, batchDuration, portType);
-                }).appendTo(portContainerEditContainer);
+                        // show the configuration dialog
+                        configureRemotePort(port.id, portName, portConcurrentTasks, portCompression, batchCount, batchSize, batchDuration, portType);
+                    }).appendTo(portContainerEditContainer);
 
-                // show/hide the edit button as appropriate
-                if (port.transmitting === true) {
-                    editRemotePort.hide();
-                } else {
-                    editRemotePort.show();
+                    // show/hide the edit button as appropriate
+                    if (port.transmitting === true) {
+                        editRemotePort.hide();
+                    } else {
+                        editRemotePort.show();
+                    }
+                } else if (port.exists === false) {
+                    $('<div class="remote-port-removed"/>').appendTo(portContainerEditContainer).qtip($.extend({},
+                        nfCommon.config.tooltipConfig,
+                        {
+                            content: 'This port has been removed.'
+                        }));
                 }
-            } else if (port.exists === false) {
-                $('<div class="remote-port-removed"/>').appendTo(portContainerEditContainer).qtip($.extend({},
-                    nfCommon.config.tooltipConfig,
-                    {
-                        content: 'This port has been removed.'
-                    }));
             }
 
             // only allow modifications to transmission when the swtich is defined
@@ -371,11 +377,8 @@
                     // create the remote process group details
                     var remoteProcessGroupPortEntity = {
                         'revision': nfClient.getRevision(remoteProcessGroupData),
-                        'remoteProcessGroupPort': {
-                            id: port.id,
-                            groupId: remoteProcessGroupId,
-                            transmitting: isTransmitting
-                        }
+                        'disconnectedNodeAcknowledged': nfStorage.isDisconnectionAcknowledged(),
+                        'state': isTransmitting ? "TRANSMITTING" : "STOPPED"
                     };
 
                     // determine the type of port this is
@@ -388,7 +391,7 @@
                     $.ajax({
                         type: 'PUT',
                         data: JSON.stringify(remoteProcessGroupPortEntity),
-                        url: remoteProcessGroupData.uri + portContextPath + encodeURIComponent(port.id),
+                        url: remoteProcessGroupData.uri + portContextPath + encodeURIComponent(port.id) + "/run-status",
                         dataType: 'json',
                         contentType: 'application/json'
                     }).done(function (response) {
@@ -463,7 +466,7 @@
         } else {
             // show the disabled transmission switch
             if (port.transmitting === true) {
-                (nfNgBridge.injector.get('$compile')($('<md-switch style="margin:0px" class="md-primary disabled-active-transmission" aria-label="Toggle port transmission"></md-switch>'))(nfNgBridge.rootScope)).appendTo(portContainerEditContainer);
+                (nfNgBridge.injector.get('$compile')($('<md-switch style="margin:0px" class="md-primary enabled-inactive-transmission" aria-label="Toggle port transmission"></md-switch>'))(nfNgBridge.rootScope)).appendTo(portContainerEditContainer);
             } else {
                 (nfNgBridge.injector.get('$compile')($('<md-switch ng-disabled="true" style="margin:0px" class="md-primary disabled-inactive-transmission" aria-label="Toggle port transmission"></md-switch>'))(nfNgBridge.rootScope)).appendTo(portContainerEditContainer);
             }

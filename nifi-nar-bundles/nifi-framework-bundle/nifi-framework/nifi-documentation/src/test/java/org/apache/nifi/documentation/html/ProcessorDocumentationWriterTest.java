@@ -16,13 +16,18 @@
  */
 package org.apache.nifi.documentation.html;
 
+import org.apache.nifi.annotation.behavior.SystemResource;
+import org.apache.nifi.annotation.behavior.SystemResourceConsideration;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
+import org.apache.nifi.components.RequiredPermission;
 import org.apache.nifi.documentation.DocumentationWriter;
 import org.apache.nifi.documentation.example.DeprecatedProcessor;
 import org.apache.nifi.documentation.example.FullyDocumentedProcessor;
 import org.apache.nifi.documentation.example.NakedProcessor;
 import org.apache.nifi.documentation.example.ProcessorWithLogger;
 import org.apache.nifi.init.ProcessorInitializer;
+import org.apache.nifi.nar.ExtensionManager;
+import org.apache.nifi.nar.StandardExtensionDiscoveringManager;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -36,11 +41,13 @@ public class ProcessorDocumentationWriterTest {
 
     @Test
     public void testFullyDocumentedProcessor() throws IOException {
+        ExtensionManager extensionManager = new StandardExtensionDiscoveringManager();
+
         FullyDocumentedProcessor processor = new FullyDocumentedProcessor();
-        ProcessorInitializer initializer = new ProcessorInitializer();
+        ProcessorInitializer initializer = new ProcessorInitializer(extensionManager);
         initializer.initialize(processor);
 
-        DocumentationWriter writer = new HtmlProcessorDocumentationWriter();
+        DocumentationWriter writer = new HtmlProcessorDocumentationWriter(extensionManager);
 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
 
@@ -71,6 +78,8 @@ public class ProcessorDocumentationWriterTest {
         assertContains(results, "state management description");
 
         assertContains(results, "processor restriction description");
+        assertContains(results, RequiredPermission.READ_FILESYSTEM.getPermissionLabel());
+        assertContains(results, "Requires read filesystem permission");
 
         assertNotContains(results, "iconSecure.png");
         assertContains(results, FullyDocumentedProcessor.class.getAnnotation(CapabilityDescription.class)
@@ -81,8 +90,23 @@ public class ProcessorDocumentationWriterTest {
         assertNotContains(results, "No tags provided.");
         assertNotContains(results, "Additional Details...");
 
+        // check expression language scope
+        assertContains(results, "Supports Expression Language: true (will be evaluated using variable registry only)");
+        assertContains(results, "Supports Expression Language: true (undefined scope)");
+
+        // verify dynamic properties
+        assertContains(results, "Routes FlowFiles to relationships based on XPath");
+
         // input requirement
         assertContains(results, "This component does not allow an incoming relationship.");
+
+        // verify system resource considerations
+        assertContains(results, SystemResource.CPU.name());
+        assertContains(results, SystemResourceConsideration.DEFAULT_DESCRIPTION);
+        assertContains(results, SystemResource.DISK.name());
+        assertContains(results, "Customized disk usage description");
+        assertContains(results, SystemResource.MEMORY.name());
+        assertContains(results, "Not Specified");
 
         // verify the right OnRemoved and OnShutdown methods were called
         Assert.assertEquals(0, processor.getOnRemovedArgs());
@@ -94,11 +118,13 @@ public class ProcessorDocumentationWriterTest {
 
     @Test
     public void testNakedProcessor() throws IOException {
+        ExtensionManager extensionManager = new StandardExtensionDiscoveringManager();
+
         NakedProcessor processor = new NakedProcessor();
-        ProcessorInitializer initializer = new ProcessorInitializer();
+        ProcessorInitializer initializer = new ProcessorInitializer(extensionManager);
         initializer.initialize(processor);
 
-        DocumentationWriter writer = new HtmlProcessorDocumentationWriter();
+        DocumentationWriter writer = new HtmlProcessorDocumentationWriter(extensionManager);
 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
 
@@ -132,11 +158,13 @@ public class ProcessorDocumentationWriterTest {
 
     @Test
     public void testProcessorWithLoggerInitialization() throws IOException {
+        ExtensionManager extensionManager = new StandardExtensionDiscoveringManager();
+
         ProcessorWithLogger processor = new ProcessorWithLogger();
-        ProcessorInitializer initializer = new ProcessorInitializer();
+        ProcessorInitializer initializer = new ProcessorInitializer(extensionManager);
         initializer.initialize(processor);
 
-        DocumentationWriter writer = new HtmlProcessorDocumentationWriter();
+        DocumentationWriter writer = new HtmlProcessorDocumentationWriter(extensionManager);
 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
 
@@ -150,11 +178,13 @@ public class ProcessorDocumentationWriterTest {
 
     @Test
     public void testDeprecatedProcessor() throws IOException {
+        ExtensionManager extensionManager = new StandardExtensionDiscoveringManager();
+
         DeprecatedProcessor processor = new DeprecatedProcessor();
-        ProcessorInitializer initializer = new ProcessorInitializer();
+        ProcessorInitializer initializer = new ProcessorInitializer(extensionManager);
         initializer.initialize(processor);
 
-        DocumentationWriter writer = new HtmlProcessorDocumentationWriter();
+        DocumentationWriter writer = new HtmlProcessorDocumentationWriter(extensionManager);
 
         ByteArrayOutputStream baos = new ByteArrayOutputStream();
 

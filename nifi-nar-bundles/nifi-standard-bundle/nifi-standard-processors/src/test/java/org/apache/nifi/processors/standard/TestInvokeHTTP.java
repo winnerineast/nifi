@@ -17,6 +17,7 @@
 package org.apache.nifi.processors.standard;
 
 import org.apache.nifi.processors.standard.util.TestInvokeHttpCommon;
+import org.apache.nifi.web.util.TestServer;
 import org.apache.nifi.ssl.StandardSSLContextService;
 import org.apache.nifi.util.MockFlowFile;
 import org.apache.nifi.util.TestRunners;
@@ -84,11 +85,11 @@ public class TestInvokeHTTP extends TestInvokeHttpCommon {
     public void testSslSetHttpRequest() throws Exception {
 
         final Map<String, String> sslProperties = new HashMap<>();
-        sslProperties.put(StandardSSLContextService.KEYSTORE.getName(), "src/test/resources/localhost-ks.jks");
-        sslProperties.put(StandardSSLContextService.KEYSTORE_PASSWORD.getName(), "localtest");
+        sslProperties.put(StandardSSLContextService.KEYSTORE.getName(), "src/test/resources/keystore.jks");
+        sslProperties.put(StandardSSLContextService.KEYSTORE_PASSWORD.getName(), "passwordpassword");
         sslProperties.put(StandardSSLContextService.KEYSTORE_TYPE.getName(), "JKS");
-        sslProperties.put(StandardSSLContextService.TRUSTSTORE.getName(), "src/test/resources/localhost-ts.jks");
-        sslProperties.put(StandardSSLContextService.TRUSTSTORE_PASSWORD.getName(), "localtest");
+        sslProperties.put(StandardSSLContextService.TRUSTSTORE.getName(), "src/test/resources/truststore.jks");
+        sslProperties.put(StandardSSLContextService.TRUSTSTORE_PASSWORD.getName(), "passwordpassword");
         sslProperties.put(StandardSSLContextService.TRUSTSTORE_TYPE.getName(), "JKS");
 
         runner = TestRunners.newTestRunner(InvokeHTTP.class);
@@ -137,8 +138,13 @@ public class TestInvokeHTTP extends TestInvokeHttpCommon {
         addHandler(new MyProxyHandler());
         URL proxyURL = new URL(url);
 
+        runner.setVariable("proxy.host", proxyURL.getHost());
+        runner.setVariable("proxy.port", String.valueOf(proxyURL.getPort()));
+        runner.setVariable("proxy.username", "username");
+        runner.setVariable("proxy.password", "password");
+
         runner.setProperty(InvokeHTTP.PROP_URL, "http://nifi.apache.org/"); // just a dummy URL no connection goes out
-        runner.setProperty(InvokeHTTP.PROP_PROXY_HOST, proxyURL.getHost());
+        runner.setProperty(InvokeHTTP.PROP_PROXY_HOST, "${proxy.host}");
 
         try{
             runner.run();
@@ -146,9 +152,9 @@ public class TestInvokeHTTP extends TestInvokeHttpCommon {
         } catch (AssertionError e){
             // Expect assertion error when proxy port isn't set but host is.
         }
-        runner.setProperty(InvokeHTTP.PROP_PROXY_PORT, String.valueOf(proxyURL.getPort()));
+        runner.setProperty(InvokeHTTP.PROP_PROXY_PORT, "${proxy.port}");
 
-        runner.setProperty(InvokeHTTP.PROP_PROXY_USER, "username");
+        runner.setProperty(InvokeHTTP.PROP_PROXY_USER, "${proxy.username}");
 
         try{
             runner.run();
@@ -156,7 +162,7 @@ public class TestInvokeHTTP extends TestInvokeHttpCommon {
         } catch (AssertionError e){
             // Expect assertion error when proxy password isn't set but host is.
         }
-        runner.setProperty(InvokeHTTP.PROP_PROXY_PASSWORD, "password");
+        runner.setProperty(InvokeHTTP.PROP_PROXY_PASSWORD, "${proxy.password}");
 
         createFlowFiles(runner);
 

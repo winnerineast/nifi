@@ -17,6 +17,17 @@
 
 package org.apache.nifi.processors.standard.merge;
 
+import org.apache.nifi.components.PropertyValue;
+import org.apache.nifi.flowfile.FlowFile;
+import org.apache.nifi.logging.ComponentLog;
+import org.apache.nifi.processor.DataUnit;
+import org.apache.nifi.processor.ProcessContext;
+import org.apache.nifi.processor.ProcessSession;
+import org.apache.nifi.processor.ProcessSessionFactory;
+import org.apache.nifi.processors.standard.MergeContent;
+import org.apache.nifi.processors.standard.MergeRecord;
+import org.apache.nifi.serialization.RecordReader;
+
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -29,19 +40,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
-
-import org.apache.nifi.components.PropertyValue;
-import org.apache.nifi.flowfile.FlowFile;
-import org.apache.nifi.logging.ComponentLog;
-import org.apache.nifi.processor.DataUnit;
-import org.apache.nifi.processor.ProcessContext;
-import org.apache.nifi.processor.ProcessSession;
-import org.apache.nifi.processor.ProcessSessionFactory;
-import org.apache.nifi.processors.standard.MergeContent;
-import org.apache.nifi.processors.standard.MergeRecord;
-import org.apache.nifi.schema.access.SchemaNotFoundException;
-import org.apache.nifi.serialization.MalformedRecordException;
-import org.apache.nifi.serialization.RecordReader;
+import java.util.function.Predicate;
 
 public class RecordBinManager {
 
@@ -108,12 +107,9 @@ public class RecordBinManager {
      * @param block if another thread is already writing to the desired bin, passing <code>true</code> for this parameter will block until the other thread(s) have finished so
      *            that the records can still be added to the desired bin. Passing <code>false</code> will result in moving on to another bin.
      *
-     * @throws SchemaNotFoundException if unable to find the schema for the record writer
-     * @throws MalformedRecordException if unable to read a record
      * @throws IOException if there is an IO problem reading from the stream or writing to the stream
      */
-    public void add(final String groupIdentifier, final FlowFile flowFile, final RecordReader reader, final ProcessSession session, final boolean block)
-        throws IOException, MalformedRecordException, SchemaNotFoundException {
+    public void add(final String groupIdentifier, final FlowFile flowFile, final RecordReader reader, final ProcessSession session, final boolean block) throws IOException {
 
         final List<RecordBin> currentBins;
         lock.lock();
@@ -193,17 +189,17 @@ public class RecordBinManager {
 
         final PropertyValue maxMillisValue = context.getProperty(MergeRecord.MAX_BIN_AGE);
         final String maxBinAge = maxMillisValue.getValue();
-        final long maxBinMillis = maxMillisValue.isSet() ? maxMillisValue.asTimePeriod(TimeUnit.MILLISECONDS).longValue() : Long.MAX_VALUE;
+        final long maxBinMillis = maxMillisValue.isSet() ? maxMillisValue.asTimePeriod(TimeUnit.MILLISECONDS) : Long.MAX_VALUE;
 
-        final String recordCountAttribute;
+        final String fragmentCountAttribute;
         final String mergeStrategy = context.getProperty(MergeRecord.MERGE_STRATEGY).getValue();
         if (MergeRecord.MERGE_STRATEGY_DEFRAGMENT.getValue().equals(mergeStrategy)) {
-            recordCountAttribute = MergeContent.FRAGMENT_COUNT_ATTRIBUTE;
+            fragmentCountAttribute = MergeContent.FRAGMENT_COUNT_ATTRIBUTE;
         } else {
-            recordCountAttribute = null;
+            fragmentCountAttribute = null;
         }
 
-        return new RecordBinThresholds(minRecords, maxRecords, minBytes, maxBytes, maxBinMillis, maxBinAge, recordCountAttribute);
+        return new RecordBinThresholds(minRecords, maxRecords, minBytes, maxBytes, maxBinMillis, maxBinAge, fragmentCountAttribute);
     }
 
 
@@ -237,8 +233,16 @@ public class RecordBinManager {
     }
 
 
-    public void completeExpiredBins() throws IOException {
+    public int completeExpiredBins() throws IOException {
         final long maxNanos = maxBinAgeNanos.get();
+        return handleCompletedBins(bin -> bin.isOlderThan(maxNanos, TimeUnit.NANOSECONDS));
+    }
+
+    public int completeFullEnoughBins() throws IOException {
+        return handleCompletedBins(RecordBin::isFullEnough);
+    }
+
+    private int handleCompletedBins(final Predicate<RecordBin> completionTest) throws IOException {
         final Map<String, List<RecordBin>> expiredBinMap = new HashMap<>();
 
         lock.lock();
@@ -248,7 +252,7 @@ public class RecordBinManager {
                 final List<RecordBin> bins = entry.getValue();
 
                 for (final RecordBin bin : bins) {
-                    if (bin.isOlderThan(maxNanos, TimeUnit.NANOSECONDS)) {
+                    if (completionTest.test(bin)) {
                         final List<RecordBin> expiredBinsForKey = expiredBinMap.computeIfAbsent(key, ignore -> new ArrayList<>());
                         expiredBinsForKey.add(bin);
                     }
@@ -258,6 +262,7 @@ public class RecordBinManager {
             lock.unlock();
         }
 
+        int completed = 0;
         for (final Map.Entry<String, List<RecordBin>> entry : expiredBinMap.entrySet()) {
             final String key = entry.getKey();
             final List<RecordBin> expiredBins = entry.getValue();
@@ -265,11 +270,15 @@ public class RecordBinManager {
             for (final RecordBin bin : expiredBins) {
                 logger.debug("Completing Bin {} because it has expired");
                 bin.complete("Bin has reached Max Bin Age");
+                completed++;
             }
 
             removeBins(key, expiredBins);
         }
+
+        return completed;
     }
+
 
     private void removeBins(final String key, final List<RecordBin> bins) {
         lock.lock();

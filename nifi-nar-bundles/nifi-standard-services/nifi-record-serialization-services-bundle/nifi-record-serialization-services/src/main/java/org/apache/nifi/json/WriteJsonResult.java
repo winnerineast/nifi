@@ -17,19 +17,14 @@
 
 package org.apache.nifi.json;
 
-import java.io.IOException;
-import java.io.OutputStream;
-import java.math.BigInteger;
-import java.text.DateFormat;
-import java.util.Map;
-import java.util.Optional;
-import java.util.function.Supplier;
-
 import org.apache.nifi.logging.ComponentLog;
+import org.apache.nifi.record.NullSuppression;
 import org.apache.nifi.schema.access.SchemaAccessWriter;
 import org.apache.nifi.serialization.AbstractRecordSetWriter;
 import org.apache.nifi.serialization.RecordSetWriter;
+import org.apache.nifi.serialization.WriteResult;
 import org.apache.nifi.serialization.record.DataType;
+import org.apache.nifi.serialization.record.RawRecordWriter;
 import org.apache.nifi.serialization.record.Record;
 import org.apache.nifi.serialization.record.RecordField;
 import org.apache.nifi.serialization.record.RecordFieldType;
@@ -41,26 +36,46 @@ import org.apache.nifi.serialization.record.type.MapDataType;
 import org.apache.nifi.serialization.record.type.RecordDataType;
 import org.apache.nifi.serialization.record.util.DataTypeUtils;
 import org.codehaus.jackson.JsonFactory;
-import org.codehaus.jackson.JsonGenerationException;
 import org.codehaus.jackson.JsonGenerator;
+import org.codehaus.jackson.util.MinimalPrettyPrinter;
 
-public class WriteJsonResult extends AbstractRecordSetWriter implements RecordSetWriter {
+import java.io.IOException;
+import java.io.OutputStream;
+import java.math.BigInteger;
+import java.text.DateFormat;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.function.Supplier;
+
+public class WriteJsonResult extends AbstractRecordSetWriter implements RecordSetWriter, RawRecordWriter {
     private final ComponentLog logger;
     private final SchemaAccessWriter schemaAccess;
     private final RecordSchema recordSchema;
-    private final JsonFactory factory = new JsonFactory();
     private final JsonGenerator generator;
+    private final NullSuppression nullSuppression;
+    private final OutputGrouping outputGrouping;
     private final Supplier<DateFormat> LAZY_DATE_FORMAT;
     private final Supplier<DateFormat> LAZY_TIME_FORMAT;
     private final Supplier<DateFormat> LAZY_TIMESTAMP_FORMAT;
+    private String mimeType = "application/json";
 
     public WriteJsonResult(final ComponentLog logger, final RecordSchema recordSchema, final SchemaAccessWriter schemaAccess, final OutputStream out, final boolean prettyPrint,
-        final String dateFormat, final String timeFormat, final String timestampFormat) throws IOException {
+            final NullSuppression nullSuppression, final OutputGrouping outputGrouping, final String dateFormat, final String timeFormat, final String timestampFormat) throws IOException {
+        this(logger, recordSchema, schemaAccess, out, prettyPrint, nullSuppression, outputGrouping, dateFormat, timeFormat, timestampFormat, "application/json");
+    }
+
+    public WriteJsonResult(final ComponentLog logger, final RecordSchema recordSchema, final SchemaAccessWriter schemaAccess, final OutputStream out, final boolean prettyPrint,
+        final NullSuppression nullSuppression, final OutputGrouping outputGrouping, final String dateFormat, final String timeFormat, final String timestampFormat,
+        final String mimeType) throws IOException {
 
         super(out);
         this.logger = logger;
         this.recordSchema = recordSchema;
         this.schemaAccess = schemaAccess;
+        this.nullSuppression = nullSuppression;
+        this.outputGrouping = outputGrouping;
+        this.mimeType = mimeType;
 
         final DateFormat df = dateFormat == null ? null : DataTypeUtils.getDateFormat(dateFormat);
         final DateFormat tf = timeFormat == null ? null : DataTypeUtils.getDateFormat(timeFormat);
@@ -70,9 +85,13 @@ public class WriteJsonResult extends AbstractRecordSetWriter implements RecordSe
         LAZY_TIME_FORMAT = () -> tf;
         LAZY_TIMESTAMP_FORMAT = () -> tsf;
 
+        final JsonFactory factory = new JsonFactory();
         this.generator = factory.createJsonGenerator(out);
         if (prettyPrint) {
             generator.useDefaultPrettyPrinter();
+        } else if (OutputGrouping.OUTPUT_ONELINE.equals(outputGrouping)) {
+            // Use a minimal pretty printer with a newline object separator, will output one JSON object per line
+            generator.setPrettyPrinter(new MinimalPrettyPrinter("\n"));
         }
     }
 
@@ -82,12 +101,16 @@ public class WriteJsonResult extends AbstractRecordSetWriter implements RecordSe
         final OutputStream out = getOutputStream();
         schemaAccess.writeHeader(recordSchema, out);
 
-        generator.writeStartArray();
+        if (outputGrouping == OutputGrouping.OUTPUT_ARRAY) {
+            generator.writeStartArray();
+        }
     }
 
     @Override
     protected Map<String, String> onFinishRecordSet() throws IOException {
-        generator.writeEndArray();
+        if (outputGrouping == OutputGrouping.OUTPUT_ARRAY) {
+            generator.writeEndArray();
+        }
         return schemaAccess.getAttributes(recordSchema);
     }
 
@@ -107,6 +130,7 @@ public class WriteJsonResult extends AbstractRecordSetWriter implements RecordSe
         }
     }
 
+
     @Override
     public Map<String, String> writeRecord(final Record record) throws IOException {
         // If we are not writing an active record set, then we need to ensure that we write the
@@ -116,12 +140,26 @@ public class WriteJsonResult extends AbstractRecordSetWriter implements RecordSe
             schemaAccess.writeHeader(recordSchema, getOutputStream());
         }
 
-        writeRecord(record, recordSchema, generator, g -> g.writeStartObject(), g -> g.writeEndObject());
+        writeRecord(record, recordSchema, generator, JsonGenerator::writeStartObject, JsonGenerator::writeEndObject, true);
         return schemaAccess.getAttributes(recordSchema);
     }
 
-    private void writeRecord(final Record record, final RecordSchema writeSchema, final JsonGenerator generator, final GeneratorTask startTask, final GeneratorTask endTask)
-        throws JsonGenerationException, IOException {
+    @Override
+    public WriteResult writeRawRecord(final Record record) throws IOException {
+        // If we are not writing an active record set, then we need to ensure that we write the
+        // schema information.
+        if (!isActiveRecordSet()) {
+            generator.flush();
+            schemaAccess.writeHeader(recordSchema, getOutputStream());
+        }
+
+        writeRecord(record, recordSchema, generator, JsonGenerator::writeStartObject, JsonGenerator::writeEndObject, false);
+        final Map<String, String> attributes = schemaAccess.getAttributes(recordSchema);
+        return WriteResult.of(incrementRecordCount(), attributes);
+    }
+
+    private void writeRecord(final Record record, final RecordSchema writeSchema, final JsonGenerator generator,
+        final GeneratorTask startTask, final GeneratorTask endTask, final boolean schemaAware) throws IOException {
 
         final Optional<SerializedForm> serializedForm = record.getSerializedForm();
         if (serializedForm.isPresent()) {
@@ -137,19 +175,38 @@ public class WriteJsonResult extends AbstractRecordSetWriter implements RecordSe
 
         try {
             startTask.apply(generator);
-            for (int i = 0; i < writeSchema.getFieldCount(); i++) {
-                final RecordField field = writeSchema.getField(i);
-                final String fieldName = field.getFieldName();
-                final Object value = record.getValue(field);
-                if (value == null) {
-                    generator.writeNullField(fieldName);
-                    continue;
+
+            if (schemaAware) {
+                for (final RecordField field : writeSchema.getFields()) {
+                    final String fieldName = field.getFieldName();
+                    final Object value = record.getValue(field);
+                    if (value == null) {
+                        if (nullSuppression == NullSuppression.NEVER_SUPPRESS || (nullSuppression == NullSuppression.SUPPRESS_MISSING) && isFieldPresent(field, record)) {
+                            generator.writeNullField(fieldName);
+                        }
+
+                        continue;
+                    }
+
+                    generator.writeFieldName(fieldName);
+
+                    final DataType dataType = writeSchema.getDataType(fieldName).get();
+                    writeValue(generator, value, fieldName, dataType);
                 }
+            } else {
+                for (final String fieldName : record.getRawFieldNames()) {
+                    final Object value = record.getValue(fieldName);
+                    if (value == null) {
+                        if (nullSuppression == NullSuppression.NEVER_SUPPRESS || (nullSuppression == NullSuppression.SUPPRESS_MISSING) && record.getRawFieldNames().contains(fieldName)) {
+                            generator.writeNullField(fieldName);
+                        }
 
-                generator.writeFieldName(fieldName);
-                final DataType dataType = writeSchema.getDataType(fieldName).get();
+                        continue;
+                    }
 
-                writeValue(generator, value, fieldName, dataType, i < writeSchema.getFieldCount() - 1);
+                    generator.writeFieldName(fieldName);
+                    writeRawValue(generator, value, fieldName);
+                }
             }
 
             endTask.apply(generator);
@@ -159,16 +216,77 @@ public class WriteJsonResult extends AbstractRecordSetWriter implements RecordSe
         }
     }
 
+    private boolean isFieldPresent(final RecordField field, final Record record) {
+        final Set<String> rawFieldNames = record.getRawFieldNames();
+        if (rawFieldNames.contains(field.getFieldName())) {
+            return true;
+        }
+
+        for (final String alias : field.getAliases()) {
+            if (rawFieldNames.contains(alias)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     @SuppressWarnings("unchecked")
-    private void writeValue(final JsonGenerator generator, final Object value, final String fieldName, final DataType dataType, final boolean moreCols)
-        throws JsonGenerationException, IOException {
+    private void writeRawValue(final JsonGenerator generator, final Object value, final String fieldName) throws IOException {
+
+        if (value == null) {
+            generator.writeNull();
+            return;
+        }
+
+        if (value instanceof Record) {
+            final Record record = (Record) value;
+            writeRecord(record, record.getSchema(), generator, JsonGenerator::writeStartObject, JsonGenerator::writeEndObject, false);
+            return;
+        }
+
+        if (value instanceof Map) {
+            final Map<String, ?> map = (Map<String, ?>) value;
+            generator.writeStartObject();
+
+            for (final Map.Entry<String, ?> entry : map.entrySet()) {
+                final String mapKey = entry.getKey();
+                final Object mapValue = entry.getValue();
+                generator.writeFieldName(mapKey);
+                writeRawValue(generator, mapValue, fieldName + "." + mapKey);
+            }
+
+            generator.writeEndObject();
+            return;
+        }
+
+        if (value instanceof Object[]) {
+            final Object[] values = (Object[]) value;
+            generator.writeStartArray();
+            for (final Object element : values) {
+                writeRawValue(generator, element, fieldName);
+            }
+            generator.writeEndArray();
+            return;
+        }
+
+        generator.writeObject(value);
+    }
+
+    @SuppressWarnings("unchecked")
+    private void writeValue(final JsonGenerator generator, final Object value, final String fieldName, final DataType dataType) throws IOException {
         if (value == null) {
             generator.writeNull();
             return;
         }
 
         final DataType chosenDataType = dataType.getFieldType() == RecordFieldType.CHOICE ? DataTypeUtils.chooseDataType(value, (ChoiceDataType) dataType) : dataType;
+        if (chosenDataType == null) {
+            logger.debug("Could not find a suitable field type in the CHOICE for field {} and value {}; will use null value", new Object[] {fieldName, value});
+            generator.writeNull();
+            return;
+        }
+
         final Object coercedValue = DataTypeUtils.convertType(value, chosenDataType, LAZY_DATE_FORMAT, LAZY_TIME_FORMAT, LAZY_TIMESTAMP_FORMAT, fieldName);
         if (coercedValue == null) {
             generator.writeNull();
@@ -242,7 +360,7 @@ public class WriteJsonResult extends AbstractRecordSetWriter implements RecordSe
                 final Record record = (Record) coercedValue;
                 final RecordDataType recordDataType = (RecordDataType) chosenDataType;
                 final RecordSchema childSchema = recordDataType.getChildSchema();
-                writeRecord(record, childSchema, generator, gen -> gen.writeStartObject(), gen -> gen.writeEndObject());
+                writeRecord(record, childSchema, generator, JsonGenerator::writeStartObject, JsonGenerator::writeEndObject, true);
                 break;
             }
             case MAP: {
@@ -250,12 +368,12 @@ public class WriteJsonResult extends AbstractRecordSetWriter implements RecordSe
                 final DataType valueDataType = mapDataType.getValueType();
                 final Map<String, ?> map = (Map<String, ?>) coercedValue;
                 generator.writeStartObject();
-                int i = 0;
+
                 for (final Map.Entry<String, ?> entry : map.entrySet()) {
                     final String mapKey = entry.getKey();
                     final Object mapValue = entry.getValue();
                     generator.writeFieldName(mapKey);
-                    writeValue(generator, mapValue, fieldName + "." + mapKey, valueDataType, ++i < map.size());
+                    writeValue(generator, mapValue, fieldName + "." + mapKey, valueDataType);
                 }
                 generator.writeEndObject();
                 break;
@@ -264,7 +382,7 @@ public class WriteJsonResult extends AbstractRecordSetWriter implements RecordSe
             default:
                 if (coercedValue instanceof Object[]) {
                     final Object[] values = (Object[]) coercedValue;
-                    final ArrayDataType arrayDataType = (ArrayDataType) dataType;
+                    final ArrayDataType arrayDataType = (ArrayDataType) chosenDataType;
                     final DataType elementType = arrayDataType.getElementType();
                     writeArray(values, fieldName, generator, elementType);
                 } else {
@@ -274,13 +392,10 @@ public class WriteJsonResult extends AbstractRecordSetWriter implements RecordSe
         }
     }
 
-    private void writeArray(final Object[] values, final String fieldName, final JsonGenerator generator, final DataType elementType)
-        throws JsonGenerationException, IOException {
+    private void writeArray(final Object[] values, final String fieldName, final JsonGenerator generator, final DataType elementType) throws IOException {
         generator.writeStartArray();
-        for (int i = 0; i < values.length; i++) {
-            final boolean moreEntries = i < values.length - 1;
-            final Object element = values[i];
-            writeValue(generator, element, fieldName, elementType, moreEntries);
+        for (final Object element : values) {
+            writeValue(generator, element, fieldName, elementType);
         }
         generator.writeEndArray();
     }
@@ -288,10 +403,10 @@ public class WriteJsonResult extends AbstractRecordSetWriter implements RecordSe
 
     @Override
     public String getMimeType() {
-        return "application/json";
+        return this.mimeType;
     }
 
-    private static interface GeneratorTask {
-        void apply(JsonGenerator generator) throws JsonGenerationException, IOException;
+    private interface GeneratorTask {
+        void apply(JsonGenerator generator) throws IOException;
     }
 }

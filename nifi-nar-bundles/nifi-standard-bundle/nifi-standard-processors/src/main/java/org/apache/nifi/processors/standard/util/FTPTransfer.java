@@ -17,6 +17,7 @@
 package org.apache.nifi.processors.standard.util;
 
 import java.io.File;
+import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetAddress;
@@ -28,10 +29,12 @@ import java.nio.file.Paths;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 import org.apache.commons.net.ftp.FTPClient;
@@ -39,11 +42,18 @@ import org.apache.commons.net.ftp.FTPFile;
 import org.apache.commons.net.ftp.FTPHTTPClient;
 import org.apache.commons.net.ftp.FTPReply;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.ValidationContext;
+import org.apache.nifi.components.ValidationResult;
+import org.apache.nifi.context.PropertyContext;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.logging.ComponentLog;
+import org.apache.nifi.processor.DataUnit;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
+import org.apache.nifi.proxy.ProxyConfiguration;
+import org.apache.nifi.proxy.ProxySpec;
 
 public class FTPTransfer implements FileTransfer {
 
@@ -74,7 +84,7 @@ public class FTPTransfer implements FileTransfer {
         .addValidator(StandardValidators.PORT_VALIDATOR)
         .required(true)
         .defaultValue("21")
-        .expressionLanguageSupported(true)
+        .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
         .build();
     public static final PropertyDescriptor PROXY_TYPE = new PropertyDescriptor.Builder()
         .name("Proxy Type")
@@ -86,24 +96,34 @@ public class FTPTransfer implements FileTransfer {
         .name("Proxy Host")
         .description("The fully qualified hostname or IP address of the proxy server")
         .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+        .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
         .build();
     public static final PropertyDescriptor PROXY_PORT = new PropertyDescriptor.Builder()
         .name("Proxy Port")
         .description("The port of the proxy server")
         .addValidator(StandardValidators.PORT_VALIDATOR)
+        .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
         .build();
     public static final PropertyDescriptor HTTP_PROXY_USERNAME = new PropertyDescriptor.Builder()
         .name("Http Proxy Username")
         .description("Http Proxy Username")
         .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+        .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
         .required(false)
         .build();
     public static final PropertyDescriptor HTTP_PROXY_PASSWORD = new PropertyDescriptor.Builder()
         .name("Http Proxy Password")
         .description("Http Proxy Password")
         .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+        .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
         .required(false)
         .sensitive(true)
+        .build();
+    public static final PropertyDescriptor BUFFER_SIZE = new PropertyDescriptor.Builder()
+        .name("Internal Buffer Size")
+        .description("Set the internal buffer size for buffered data streams")
+        .defaultValue("16KB")
+        .addValidator(StandardValidators.DATA_SIZE_VALIDATOR)
         .build();
     public static final PropertyDescriptor UTF8_ENCODING = new PropertyDescriptor.Builder()
             .name("ftp-use-utf8")
@@ -114,6 +134,10 @@ public class FTPTransfer implements FileTransfer {
             .defaultValue("false")
             .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
             .build();
+
+    private static final ProxySpec[] PROXY_SPECS = {ProxySpec.HTTP_AUTH, ProxySpec.SOCKS};
+    public static final PropertyDescriptor PROXY_CONFIGURATION_SERVICE
+            = ProxyConfiguration.createProxyConfigPropertyDescriptor(true, PROXY_SPECS);
 
     private final ComponentLog logger;
 
@@ -126,6 +150,10 @@ public class FTPTransfer implements FileTransfer {
     public FTPTransfer(final ProcessContext context, final ComponentLog logger) {
         this.ctx = context;
         this.logger = logger;
+    }
+
+    public static void validateProxySpec(ValidationContext context, Collection<ValidationResult> results) {
+        ProxyConfiguration.validateProxySpec(context, results, PROXY_SPECS);
     }
 
     @Override
@@ -177,6 +205,7 @@ public class FTPTransfer implements FileTransfer {
 
         final boolean ignoreDottedFiles = ctx.getProperty(FileTransfer.IGNORE_DOTTED_FILES).asBoolean();
         final boolean recurse = ctx.getProperty(FileTransfer.RECURSIVE_SEARCH).asBoolean();
+        final boolean symlink = ctx.getProperty(FileTransfer.FOLLOW_SYMLINK).asBoolean();
         final String fileFilterRegex = ctx.getProperty(FileTransfer.FILE_FILTER_REGEX).getValue();
         final Pattern pattern = (fileFilterRegex == null) ? null : Pattern.compile(fileFilterRegex);
         final String pathFilterRegex = ctx.getProperty(FileTransfer.PATH_FILTER_REGEX).getValue();
@@ -228,11 +257,13 @@ public class FTPTransfer implements FileTransfer {
             final File newFullPath = new File(path, filename);
             final String newFullForwardPath = newFullPath.getPath().replace("\\", "/");
 
-            if (recurse && file.isDirectory()) {
+            // if is a directory and we're supposed to recurse
+            // OR if is a link and we're supposed to follow symlink
+            if ((recurse && file.isDirectory()) || (symlink && file.isSymbolicLink())) {
                 try {
                     listing.addAll(getListing(newFullForwardPath, depth + 1, maxResults - count));
                 } catch (final IOException e) {
-                    logger.error("Unable to get listing from " + newFullForwardPath + "; skipping this subdirectory", e);
+                    logger.error("Unable to get listing from " + newFullForwardPath + "; skipping", e);
                 }
             }
 
@@ -289,10 +320,16 @@ public class FTPTransfer implements FileTransfer {
 
     @Override
     public InputStream getInputStream(final String remoteFileName, final FlowFile flowFile) throws IOException {
-        final FTPClient client = getClient(null);
+        final FTPClient client = getClient(flowFile);
         InputStream in = client.retrieveFileStream(remoteFileName);
         if (in == null) {
-            throw new IOException(client.getReplyString());
+            final String response = client.getReplyString();
+            // FTPClient doesn't throw exception if file not found.
+            // Instead, response string will contain: "550 Can't open <absolute_path>: No such file or directory"
+            if (response != null && response.trim().endsWith("No such file or directory")){
+                throw new FileNotFoundException(response);
+            }
+            throw new IOException(response);
         }
         return in;
     }
@@ -301,6 +338,11 @@ public class FTPTransfer implements FileTransfer {
     public void flush() throws IOException {
         final FTPClient client = getClient(null);
         client.completePendingCommand();
+    }
+
+    @Override
+    public boolean flush(final FlowFile flowFile) throws IOException {
+        return getClient(flowFile).completePendingCommand();
     }
 
     @Override
@@ -444,8 +486,8 @@ public class FTPTransfer implements FileTransfer {
 
 
     @Override
-    public void rename(final String source, final String target) throws IOException {
-        final FTPClient client = getClient(null);
+    public void rename(final FlowFile flowFile, final String source, final String target) throws IOException {
+        final FTPClient client = getClient(flowFile);
         final boolean renameSuccessful = client.rename(source, target);
         if (!renameSuccessful) {
             throw new IOException("Failed to rename temporary file " + source + " to " + target + " due to: " + client.getReplyString());
@@ -453,8 +495,8 @@ public class FTPTransfer implements FileTransfer {
     }
 
     @Override
-    public void deleteFile(final String path, final String remoteFileName) throws IOException {
-        final FTPClient client = getClient(null);
+    public void deleteFile(final FlowFile flowFile, final String path, final String remoteFileName) throws IOException {
+        final FTPClient client = getClient(flowFile);
         if (path != null) {
             setWorkingDirectory(path);
         }
@@ -464,8 +506,8 @@ public class FTPTransfer implements FileTransfer {
     }
 
     @Override
-    public void deleteDirectory(final String remoteDirectoryName) throws IOException {
-        final FTPClient client = getClient(null);
+    public void deleteDirectory(final FlowFile flowFile, final String remoteDirectoryName) throws IOException {
+        final FTPClient client = getClient(flowFile);
         final boolean success = client.removeDirectory(remoteDirectoryName);
         if (!success) {
             throw new IOException("Failed to remove directory " + remoteDirectoryName + " due to " + client.getReplyString());
@@ -509,12 +551,15 @@ public class FTPTransfer implements FileTransfer {
             }
         }
 
-        final Proxy.Type proxyType = Proxy.Type.valueOf(ctx.getProperty(PROXY_TYPE).getValue());
-        final String proxyHost = ctx.getProperty(PROXY_HOST).getValue();
-        final Integer proxyPort = ctx.getProperty(PROXY_PORT).asInteger();
+        final ProxyConfiguration proxyConfig = ProxyConfiguration.getConfiguration(ctx, createComponentProxyConfigSupplier(ctx));
+
+        final Proxy.Type proxyType = proxyConfig.getProxyType();
+        final String proxyHost = proxyConfig.getProxyServerHost();
+        final Integer proxyPort = proxyConfig.getProxyServerPort();
+
         FTPClient client;
         if (proxyType == Proxy.Type.HTTP) {
-            client = new FTPHTTPClient(proxyHost, proxyPort, ctx.getProperty(HTTP_PROXY_USERNAME).getValue(), ctx.getProperty(HTTP_PROXY_PASSWORD).getValue());
+            client = new FTPHTTPClient(proxyHost, proxyPort, proxyConfig.getProxyUserName(), proxyConfig.getProxyUserPassword());
         } else {
             client = new FTPClient();
             if (proxyType == Proxy.Type.SOCKS) {
@@ -522,6 +567,7 @@ public class FTPTransfer implements FileTransfer {
             }
         }
         this.client = client;
+        client.setBufferSize(ctx.getProperty(BUFFER_SIZE).asDataSize(DataUnit.B).intValue());
         client.setDataTimeout(ctx.getProperty(DATA_TIMEOUT).asTimePeriod(TimeUnit.MILLISECONDS).intValue());
         client.setDefaultTimeout(ctx.getProperty(CONNECTION_TIMEOUT).asTimePeriod(TimeUnit.MILLISECONDS).intValue());
         client.setRemoteVerificationEnabled(false);
@@ -613,4 +659,17 @@ public class FTPTransfer implements FileTransfer {
         }
         return number;
     }
+
+    public static Supplier<ProxyConfiguration> createComponentProxyConfigSupplier(final PropertyContext ctx) {
+        return () -> {
+            final ProxyConfiguration componentProxyConfig = new ProxyConfiguration();
+            componentProxyConfig.setProxyType(Proxy.Type.valueOf(ctx.getProperty(PROXY_TYPE).getValue()));
+            componentProxyConfig.setProxyServerHost(ctx.getProperty(PROXY_HOST).evaluateAttributeExpressions().getValue());
+            componentProxyConfig.setProxyServerPort(ctx.getProperty(PROXY_PORT).evaluateAttributeExpressions().asInteger());
+            componentProxyConfig.setProxyUserName(ctx.getProperty(HTTP_PROXY_USERNAME).evaluateAttributeExpressions().getValue());
+            componentProxyConfig.setProxyUserPassword(ctx.getProperty(HTTP_PROXY_PASSWORD).evaluateAttributeExpressions().getValue());
+            return componentProxyConfig;
+        };
+    }
+
 }

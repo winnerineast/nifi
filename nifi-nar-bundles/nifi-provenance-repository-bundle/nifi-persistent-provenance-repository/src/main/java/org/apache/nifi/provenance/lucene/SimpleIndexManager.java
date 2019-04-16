@@ -17,17 +17,6 @@
 
 package org.apache.nifi.provenance.lucene;
 
-import java.io.Closeable;
-import java.io.File;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.standard.StandardAnalyzer;
 import org.apache.lucene.index.ConcurrentMergeScheduler;
@@ -44,6 +33,19 @@ import org.apache.nifi.provenance.util.NamedThreadFactory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.Closeable;
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+
 public class SimpleIndexManager implements IndexManager {
     private static final Logger logger = LoggerFactory.getLogger(SimpleIndexManager.class);
 
@@ -53,7 +55,7 @@ public class SimpleIndexManager implements IndexManager {
 
     public SimpleIndexManager(final RepositoryConfiguration repoConfig) {
         this.repoConfig = repoConfig;
-        this.searchExecutor = Executors.newFixedThreadPool(repoConfig.getQueryThreadPoolSize(), new NamedThreadFactory("Search Lucene Index"));
+        this.searchExecutor = Executors.newFixedThreadPool(repoConfig.getQueryThreadPoolSize(), new NamedThreadFactory("Search Lucene Index", true));
     }
 
     @Override
@@ -68,6 +70,20 @@ public class SimpleIndexManager implements IndexManager {
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             searchExecutor.shutdownNow();
+        }
+
+        synchronized (writerCounts) {
+            final Set<File> closed = new HashSet<>();
+
+            for (final Map.Entry<File, IndexWriterCount> entry : writerCounts.entrySet()) {
+                final IndexWriterCount count = entry.getValue();
+                if (count.getCount() < 1) {
+                    count.close();
+                    closed.add(entry.getKey());
+                }
+            }
+
+            closed.forEach(writerCounts::remove);
         }
     }
 

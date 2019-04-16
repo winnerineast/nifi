@@ -26,6 +26,7 @@ import org.apache.nifi.components.ValidationContext;
 import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.components.Validator;
 import org.apache.nifi.expression.AttributeExpression;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.processor.AbstractProcessor;
 import org.apache.nifi.processor.ProcessContext;
@@ -61,7 +62,7 @@ import java.util.TreeSet;
 @CapabilityDescription("Sends a message to your team on slack.com")
 @InputRequirement(InputRequirement.Requirement.INPUT_REQUIRED)
 @DynamicProperty(name = "A JSON object to add to Slack's \"attachments\" JSON payload.", value = "JSON-formatted string to add to Slack's payload JSON appended to the \"attachments\" JSON array.",
-        supportsExpressionLanguage = true,
+        expressionLanguageScope = ExpressionLanguageScope.FLOWFILE_ATTRIBUTES,
         description = "Converts the contents of each value specified by the Dynamic Property's value to JSON and appends it to the payload being sent to Slack.")
 public class PutSlack extends AbstractProcessor {
 
@@ -73,6 +74,7 @@ public class PutSlack extends AbstractProcessor {
             .required(true)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .addValidator(StandardValidators.URL_VALIDATOR)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .sensitive(true)
             .build();
 
@@ -82,7 +84,7 @@ public class PutSlack extends AbstractProcessor {
             .displayName("Webhook Text")
             .description("The text sent in the webhook message")
             .required(true)
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
 
@@ -93,7 +95,7 @@ public class PutSlack extends AbstractProcessor {
             .description("A public channel using #channel or direct message using @username. If not specified, " +
                     "the default webhook channel as specified in Slack's Incoming Webhooks web interface is used.")
             .required(false)
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
 
@@ -103,7 +105,7 @@ public class PutSlack extends AbstractProcessor {
             .displayName("Username")
             .description("The displayed Slack username")
             .required(false)
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .build();
 
@@ -113,7 +115,7 @@ public class PutSlack extends AbstractProcessor {
             .displayName("Icon URL")
             .description("Icon URL to be used for the message")
             .required(false)
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(StandardValidators.URL_VALIDATOR)
             .build();
 
@@ -123,7 +125,7 @@ public class PutSlack extends AbstractProcessor {
             .displayName("Icon Emoji")
             .description("Icon Emoji to be used for the message. Must begin and end with a colon, e.g. :ghost:")
             .required(false)
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
             .addValidator(new EmojiValidator())
             .build();
@@ -163,7 +165,7 @@ public class PutSlack extends AbstractProcessor {
                 .required(false)
                 .addValidator(StandardValidators.createAttributeExpressionLanguageValidator(AttributeExpression.ResultType.STRING, true))
                 .addValidator(StandardValidators.ATTRIBUTE_KEY_PROPERTY_NAME_VALIDATOR)
-                .expressionLanguageSupported(true)
+                .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
                 .dynamic(true)
                 .build();
     }
@@ -253,7 +255,7 @@ public class PutSlack extends AbstractProcessor {
             jsonWriter.writeObject(jsonObject);
             jsonWriter.close();
 
-            URL url = new URL(context.getProperty(WEBHOOK_URL).getValue());
+            URL url = new URL(context.getProperty(WEBHOOK_URL).evaluateAttributeExpressions(flowFile).getValue());
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setRequestMethod("POST");
             conn.setDoOutput(true);
@@ -266,7 +268,7 @@ public class PutSlack extends AbstractProcessor {
             if (responseCode >= 200 && responseCode < 300) {
                 getLogger().info("Successfully posted message to Slack");
                 session.transfer(flowFile, REL_SUCCESS);
-                session.getProvenanceReporter().send(flowFile, context.getProperty(WEBHOOK_URL).getValue());
+                session.getProvenanceReporter().send(flowFile, url.toString());
             } else {
                 getLogger().error("Failed to post message to Slack with response code {}", new Object[]{responseCode});
                 flowFile = session.penalize(flowFile);

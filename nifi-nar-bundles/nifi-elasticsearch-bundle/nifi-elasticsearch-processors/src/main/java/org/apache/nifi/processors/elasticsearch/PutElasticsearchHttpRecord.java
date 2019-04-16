@@ -16,20 +16,30 @@
  */
 package org.apache.nifi.processors.elasticsearch;
 
+import com.fasterxml.jackson.core.JsonFactory;
+import com.fasterxml.jackson.core.JsonGenerator;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import okhttp3.HttpUrl;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.RequestBody;
 import okhttp3.Response;
 import okhttp3.ResponseBody;
+import org.apache.nifi.annotation.behavior.DynamicProperty;
 import org.apache.nifi.annotation.behavior.EventDriven;
 import org.apache.nifi.annotation.behavior.InputRequirement;
+import org.apache.nifi.annotation.behavior.WritesAttribute;
+import org.apache.nifi.annotation.behavior.WritesAttributes;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
+import org.apache.nifi.components.AllowableValue;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.ValidationContext;
 import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.expression.AttributeExpression;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.processor.ProcessContext;
@@ -45,6 +55,9 @@ import org.apache.nifi.schema.access.SchemaNotFoundException;
 import org.apache.nifi.serialization.MalformedRecordException;
 import org.apache.nifi.serialization.RecordReader;
 import org.apache.nifi.serialization.RecordReaderFactory;
+import org.apache.nifi.serialization.RecordSetWriter;
+import org.apache.nifi.serialization.RecordSetWriterFactory;
+import org.apache.nifi.serialization.SimpleDateFormatValidator;
 import org.apache.nifi.serialization.record.DataType;
 import org.apache.nifi.serialization.record.Record;
 import org.apache.nifi.serialization.record.RecordField;
@@ -56,18 +69,15 @@ import org.apache.nifi.serialization.record.type.MapDataType;
 import org.apache.nifi.serialization.record.type.RecordDataType;
 import org.apache.nifi.serialization.record.util.DataTypeUtils;
 import org.apache.nifi.util.StringUtils;
-import org.codehaus.jackson.JsonFactory;
-import org.codehaus.jackson.JsonGenerator;
-import org.codehaus.jackson.JsonNode;
-import org.codehaus.jackson.node.ArrayNode;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.math.BigInteger;
-import java.net.MalformedURLException;
 import java.net.URL;
+import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -77,8 +87,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
-import static org.apache.commons.lang3.StringUtils.trimToEmpty;
-
 
 @InputRequirement(InputRequirement.Requirement.INPUT_REQUIRED)
 @EventDriven
@@ -87,6 +95,15 @@ import static org.apache.commons.lang3.StringUtils.trimToEmpty;
         + "the index to insert into and the type of the document, as well as the operation type (index, upsert, delete, etc.). Note: The Bulk API is used to "
         + "send the records. This means that the entire contents of the incoming flow file are read into memory, and each record is transformed into a JSON document "
         + "which is added to a single HTTP request body. For very large flow files (files with a large number of records, e.g.), this could cause memory usage issues.")
+@WritesAttributes({
+        @WritesAttribute(attribute="record.count", description="The number of records in an outgoing FlowFile. This is only populated on the 'success' relationship."),
+        @WritesAttribute(attribute="failure.count", description="The number of records found by Elasticsearch to have errors. This is only populated on the 'failure' relationship.")
+})
+@DynamicProperty(
+        name = "A URL query parameter",
+        value = "The value to set it to",
+        expressionLanguageScope = ExpressionLanguageScope.VARIABLE_REGISTRY,
+        description = "Adds the specified property name/value as a query parameter in the Elasticsearch URL used for processing")
 public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcessor {
 
     public static final Relationship REL_SUCCESS = new Relationship.Builder().name("success")
@@ -107,6 +124,31 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
             .required(true)
             .build();
 
+    static final PropertyDescriptor RECORD_WRITER = new PropertyDescriptor.Builder()
+            .name("put-es-record-record-writer")
+            .displayName("Record Writer")
+            .description("After sending a batch of records, Elasticsearch will report if individual records failed to insert. As an example, this can happen if the record doesn't match the mapping" +
+                    "for the index it is being inserted into. This property specifies the Controller Service to use for writing out those individual records sent to 'failure'. If this is not set, " +
+                    "then the whole FlowFile will be routed to failure (including any records which may have been inserted successfully). Note that this will only be used if Elasticsearch reports " +
+                    "that individual records failed and that in the event that the entire FlowFile fails (e.g. in the event ES is down), the FF will be routed to failure without being interpreted " +
+                    "by this record writer. If there is an error while attempting to route the failures, the entire FlowFile will be routed to Failure. Also if every record failed individually, " +
+                    "the entire FlowFile will be routed to Failure without being parsed by the writer.")
+            .identifiesControllerService(RecordSetWriterFactory.class)
+            .required(false)
+            .build();
+
+    static final PropertyDescriptor LOG_ALL_ERRORS = new PropertyDescriptor.Builder()
+            .name("put-es-record-log-all-errors")
+            .displayName("Log all errors in batch")
+            .description("After sending a batch of records, Elasticsearch will report if individual records failed to insert. As an example, this can happen if the record doesn't match the mapping " +
+                    "for the index it is being inserted into. If this is set to true, the processor will log the failure reason for the every failed record. When set to false only the first error " +
+                    "in the batch will be logged.")
+            .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
+            .required(false)
+            .defaultValue("false")
+            .allowableValues("true", "false")
+            .build();
+
     static final PropertyDescriptor ID_RECORD_PATH = new PropertyDescriptor.Builder()
             .name("put-es-record-id-path")
             .displayName("Identifier Record Path")
@@ -115,7 +157,7 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
                     + "auto-generated by Elasticsearch. For all other Index Operations, the field's value must be non-empty.")
             .required(false)
             .addValidator(new RecordPathValidator())
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
     static final PropertyDescriptor INDEX = new PropertyDescriptor.Builder()
@@ -123,7 +165,7 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
             .displayName("Index")
             .description("The name of the index to insert into")
             .required(true)
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(StandardValidators.createAttributeExpressionLanguageValidator(
                     AttributeExpression.ResultType.STRING, true))
             .build();
@@ -133,7 +175,7 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
             .displayName("Type")
             .description("The type of this document (used by Elasticsearch for indexing and searching)")
             .required(true)
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(StandardValidators.NON_EMPTY_EL_VALIDATOR)
             .build();
 
@@ -142,9 +184,59 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
             .displayName("Index Operation")
             .description("The type of the operation used to index (index, update, upsert, delete)")
             .required(true)
-            .expressionLanguageSupported(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .addValidator(StandardValidators.NON_EMPTY_EL_VALIDATOR)
             .defaultValue("index")
+            .build();
+
+    static final AllowableValue ALWAYS_SUPPRESS = new AllowableValue("always-suppress", "Always Suppress",
+            "Fields that are missing (present in the schema but not in the record), or that have a value of null, will not be written out");
+
+    static final AllowableValue NEVER_SUPPRESS = new AllowableValue("never-suppress", "Never Suppress",
+            "Fields that are missing (present in the schema but not in the record), or that have a value of null, will be written out as a null value");
+
+    static final AllowableValue SUPPRESS_MISSING = new AllowableValue("suppress-missing", "Suppress Missing Values",
+            "When a field has a value of null, it will be written out. However, if a field is defined in the schema and not present in the record, the field will not be written out.");
+
+    static final PropertyDescriptor SUPPRESS_NULLS = new PropertyDescriptor.Builder()
+            .name("suppress-nulls")
+            .displayName("Suppress Null Values")
+            .description("Specifies how the writer should handle a null field")
+            .allowableValues(NEVER_SUPPRESS, ALWAYS_SUPPRESS, SUPPRESS_MISSING)
+            .defaultValue(NEVER_SUPPRESS.getValue())
+            .required(true)
+            .build();
+
+    static final PropertyDescriptor DATE_FORMAT = new PropertyDescriptor.Builder()
+            .name("Date Format")
+            .description("Specifies the format to use when reading/writing Date fields. "
+                    + "If not specified, the default format '" + RecordFieldType.DATE.getDefaultFormat() + "' is used. "
+                    + "If specified, the value must match the Java Simple Date Format (for example, MM/dd/yyyy for a two-digit month, followed by "
+                    + "a two-digit day, followed by a four-digit year, all separated by '/' characters, as in 01/01/2017).")
+            .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
+            .addValidator(new SimpleDateFormatValidator())
+            .required(false)
+            .build();
+    static final PropertyDescriptor TIME_FORMAT = new PropertyDescriptor.Builder()
+            .name("Time Format")
+            .description("Specifies the format to use when reading/writing Time fields. "
+                    + "If not specified, the default format '" + RecordFieldType.TIME.getDefaultFormat() + "' is used. "
+                    + "If specified, the value must match the Java Simple Date Format (for example, HH:mm:ss for a two-digit hour in 24-hour format, followed by "
+                    + "a two-digit minute, followed by a two-digit second, all separated by ':' characters, as in 18:04:15).")
+            .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
+            .addValidator(new SimpleDateFormatValidator())
+            .required(false)
+            .build();
+    static final PropertyDescriptor TIMESTAMP_FORMAT = new PropertyDescriptor.Builder()
+            .name("Timestamp Format")
+            .description("Specifies the format to use when reading/writing Timestamp fields. "
+                    + "If not specified, the default format '" + RecordFieldType.TIMESTAMP.getDefaultFormat() + "' is used. "
+                    + "If specified, the value must match the Java Simple Date Format (for example, MM/dd/yyyy HH:mm:ss for a two-digit month, followed by "
+                    + "a two-digit day, followed by a four-digit year, all separated by '/' characters; and then followed by a two-digit hour in 24-hour format, followed by "
+                    + "a two-digit minute, followed by a two-digit second, all separated by ':' characters, as in 01/01/2017 18:04:15).")
+            .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
+            .addValidator(new SimpleDateFormatValidator())
+            .required(false)
             .build();
 
     private static final Set<Relationship> relationships;
@@ -154,6 +246,12 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
 
     private final JsonFactory factory = new JsonFactory();
 
+    private volatile String nullSuppression;
+    private volatile String dateFormat;
+    private volatile String timeFormat;
+    private volatile String timestampFormat;
+    private volatile Boolean logAllErrors;
+
     static {
         final Set<Relationship> _rels = new HashSet<>();
         _rels.add(REL_SUCCESS);
@@ -161,18 +259,19 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
         _rels.add(REL_RETRY);
         relationships = Collections.unmodifiableSet(_rels);
 
-        final List<PropertyDescriptor> descriptors = new ArrayList<>();
-        descriptors.add(ES_URL);
-        descriptors.add(PROP_SSL_CONTEXT_SERVICE);
-        descriptors.add(USERNAME);
-        descriptors.add(PASSWORD);
-        descriptors.add(CONNECT_TIMEOUT);
-        descriptors.add(RESPONSE_TIMEOUT);
+        final List<PropertyDescriptor> descriptors = new ArrayList<>(COMMON_PROPERTY_DESCRIPTORS);
         descriptors.add(RECORD_READER);
+        descriptors.add(RECORD_WRITER);
+        descriptors.add(LOG_ALL_ERRORS);
         descriptors.add(ID_RECORD_PATH);
         descriptors.add(INDEX);
         descriptors.add(TYPE);
+        descriptors.add(CHARSET);
         descriptors.add(INDEX_OP);
+        descriptors.add(SUPPRESS_NULLS);
+        descriptors.add(DATE_FORMAT);
+        descriptors.add(TIME_FORMAT);
+        descriptors.add(TIMESTAMP_FORMAT);
 
         propertyDescriptors = Collections.unmodifiableList(descriptors);
     }
@@ -219,6 +318,20 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
     public void setup(ProcessContext context) {
         super.setup(context);
         recordPathCache = new RecordPathCache(10);
+        this.dateFormat = context.getProperty(DATE_FORMAT).evaluateAttributeExpressions().getValue();
+        if (this.dateFormat == null) {
+            this.dateFormat = RecordFieldType.DATE.getDefaultFormat();
+        }
+        this.timeFormat = context.getProperty(TIME_FORMAT).evaluateAttributeExpressions().getValue();
+        if (this.timeFormat == null) {
+            this.timeFormat = RecordFieldType.TIME.getDefaultFormat();
+        }
+        this.timestampFormat = context.getProperty(TIMESTAMP_FORMAT).evaluateAttributeExpressions().getValue();
+        if (this.timestampFormat == null) {
+            this.timestampFormat = RecordFieldType.TIMESTAMP.getDefaultFormat();
+        }
+
+        logAllErrors = context.getProperty(LOG_ALL_ERRORS).asBoolean();
     }
 
     @Override
@@ -230,6 +343,13 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
         }
 
         final RecordReaderFactory readerFactory = context.getProperty(RECORD_READER).asControllerService(RecordReaderFactory.class);
+        final Optional<RecordSetWriterFactory> writerFactoryOptional;
+
+        if (context.getProperty(RECORD_WRITER).isSet()) {
+            writerFactoryOptional = Optional.of(context.getProperty(RECORD_WRITER).asControllerService(RecordSetWriterFactory.class));
+        } else {
+            writerFactoryOptional = Optional.empty();
+        }
 
         // Authentication
         final String username = context.getProperty(USERNAME).evaluateAttributeExpressions(flowFile).getValue();
@@ -238,15 +358,22 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
         OkHttpClient okHttpClient = getClient();
         final ComponentLog logger = getLogger();
 
-        final String baseUrl = trimToEmpty(context.getProperty(ES_URL).evaluateAttributeExpressions().getValue());
-        final URL url;
-        try {
-            url = new URL((baseUrl.endsWith("/") ? baseUrl : baseUrl + "/") + "_bulk");
-        } catch (MalformedURLException mue) {
-            // Since we have a URL validator, something has gone very wrong, throw a ProcessException
-            context.yield();
-            throw new ProcessException(mue);
+        final String baseUrl = context.getProperty(ES_URL).evaluateAttributeExpressions().getValue().trim();
+        if (StringUtils.isEmpty(baseUrl)) {
+            throw new ProcessException("Elasticsearch URL is empty or null, this indicates an invalid Expression (missing variables, e.g.)");
         }
+        HttpUrl.Builder urlBuilder = HttpUrl.parse(baseUrl).newBuilder().addPathSegment("_bulk");
+
+        // Find the user-added properties and set them as query parameters on the URL
+        for (Map.Entry<PropertyDescriptor, String> property : context.getProperties().entrySet()) {
+            PropertyDescriptor pd = property.getKey();
+            if (pd.isDynamic()) {
+                if (property.getValue() != null) {
+                    urlBuilder = urlBuilder.addQueryParameter(pd.getName(), context.getProperty(pd).evaluateAttributeExpressions().getValue());
+                }
+            }
+        }
+        final URL url = urlBuilder.build().url();
 
         final String index = context.getProperty(INDEX).evaluateAttributeExpressions(flowFile).getValue();
         if (StringUtils.isEmpty(index)) {
@@ -274,10 +401,14 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
                 return;
         }
 
+        this.nullSuppression = context.getProperty(SUPPRESS_NULLS).getValue();
+
         final String id_path = context.getProperty(ID_RECORD_PATH).evaluateAttributeExpressions(flowFile).getValue();
         final RecordPath recordPath = StringUtils.isEmpty(id_path) ? null : recordPathCache.getCompiled(id_path);
         final StringBuilder sb = new StringBuilder();
+        final Charset charset = Charset.forName(context.getProperty(CHARSET).evaluateAttributeExpressions(flowFile).getValue());
 
+        int recordCount = 0;
         try (final InputStream in = session.read(flowFile);
              final RecordReader reader = readerFactory.createRecordReader(flowFile, in, getLogger())) {
 
@@ -308,44 +439,10 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
                 writeRecord(record, record.getSchema(), generator);
                 generator.flush();
                 generator.close();
-                json.append(out.toString());
+                json.append(out.toString(charset.name()));
 
-                if (indexOp.equalsIgnoreCase("index")) {
-                    sb.append("{\"index\": { \"_index\": \"");
-                    sb.append(index);
-                    sb.append("\", \"_type\": \"");
-                    sb.append(docType);
-                    sb.append("\"");
-                    if (!StringUtils.isEmpty(id)) {
-                        sb.append(", \"_id\": \"");
-                        sb.append(id);
-                        sb.append("\"");
-                    }
-                    sb.append("}}\n");
-                    sb.append(json);
-                    sb.append("\n");
-                } else if (indexOp.equalsIgnoreCase("upsert") || indexOp.equalsIgnoreCase("update")) {
-                    sb.append("{\"update\": { \"_index\": \"");
-                    sb.append(index);
-                    sb.append("\", \"_type\": \"");
-                    sb.append(docType);
-                    sb.append("\", \"_id\": \"");
-                    sb.append(id);
-                    sb.append("\" }\n");
-                    sb.append("{\"doc\": ");
-                    sb.append(json);
-                    sb.append(", \"doc_as_upsert\": ");
-                    sb.append(indexOp.equalsIgnoreCase("upsert"));
-                    sb.append(" }\n");
-                } else if (indexOp.equalsIgnoreCase("delete")) {
-                    sb.append("{\"delete\": { \"_index\": \"");
-                    sb.append(index);
-                    sb.append("\", \"_type\": \"");
-                    sb.append(docType);
-                    sb.append("\", \"_id\": \"");
-                    sb.append(id);
-                    sb.append("\" }\n");
-                }
+                buildBulkCommand(sb, index, docType, indexOp, id, json.toString());
+                recordCount++;
             }
         } catch (IdentifierNotFoundException infe) {
             logger.error(infe.getMessage(), new Object[]{flowFile});
@@ -372,9 +469,10 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
         }
         final int statusCode = getResponse.code();
 
+        final Set<Integer> failures = new HashSet<>();
+
         if (isSuccess(statusCode)) {
-            ResponseBody responseBody = getResponse.body();
-            try {
+            try (ResponseBody responseBody = getResponse.body()) {
                 final byte[] bodyBytes = responseBody.bytes();
 
                 JsonNode responseJson = parseJsonResponse(new ByteArrayInputStream(bodyBytes));
@@ -382,23 +480,39 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
                 // ES has no rollback, so if errors occur, log them and route the whole flow file to failure
                 if (errors) {
                     ArrayNode itemNodeArray = (ArrayNode) responseJson.get("items");
-                    if (itemNodeArray.size() > 0) {
-                        // All items are returned whether they succeeded or failed, so iterate through the item array
-                        // at the same time as the flow file list, logging failures accordingly
-                        for (int i = itemNodeArray.size() - 1; i >= 0; i--) {
-                            JsonNode itemNode = itemNodeArray.get(i);
-                            int status = itemNode.findPath("status").asInt();
-                            if (!isSuccess(status)) {
-                                String reason = itemNode.findPath("//error/reason").asText();
-                                logger.error("Failed to insert {} into Elasticsearch due to {}, transferring to failure",
-                                        new Object[]{flowFile, reason});
+                    if(itemNodeArray != null) {
+                        if (itemNodeArray.size() > 0) {
+                            // All items are returned whether they succeeded or failed, so iterate through the item array
+                            // at the same time as the flow file list, moving each to success or failure accordingly,
+                            // but only keep the first error for logging
+                            String errorReason = null;
+                            for (int i = itemNodeArray.size() - 1; i >= 0; i--) {
+                                JsonNode itemNode = itemNodeArray.get(i);
+                                int status = itemNode.findPath("status").asInt();
+                                if (!isSuccess(status)) {
+                                    if (errorReason == null || logAllErrors) {
+                                        // Use "result" if it is present; this happens for status codes like 404 Not Found, which may not have an error/reason
+                                        String reason = itemNode.findPath("result").asText();
+                                        if (StringUtils.isEmpty(reason)) {
+                                            // If there was no result, we expect an error with a string description in the "reason" field
+                                            reason = itemNode.findPath("reason").asText();
+                                        }
+                                        errorReason = reason;
+
+                                        logger.error("Failed to process record {} in FlowFile {} due to {}, transferring to failure",
+                                                new Object[]{i, flowFile, errorReason});
+                                    }
+                                    failures.add(i);
+                                }
                             }
                         }
                     }
-                    session.transfer(flowFile, REL_FAILURE);
                 } else {
+                    // Everything succeeded, route FF and end
+                    flowFile = session.putAttribute(flowFile, "record.count", Integer.toString(recordCount));
                     session.transfer(flowFile, REL_SUCCESS);
                     session.getProvenanceReporter().send(flowFile, url.toString());
+                    return;
                 }
 
             } catch (IOException ioe) {
@@ -406,6 +520,9 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
                 logger.error("Error parsing Bulk API response: {}", new Object[]{ioe.getMessage()}, ioe);
                 session.transfer(flowFile, REL_FAILURE);
                 context.yield();
+                return;
+            } finally {
+                getResponse.close();
             }
         } else if (statusCode / 100 == 5) {
             // 5xx -> RETRY, but a server error might last a while, so yield
@@ -413,11 +530,76 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
                     new Object[]{statusCode, getResponse.message()});
             session.transfer(flowFile, REL_RETRY);
             context.yield();
+            return;
         } else {  // 1xx, 3xx, 4xx, etc. -> NO RETRY
             logger.warn("Elasticsearch returned code {} with message {}, transferring flow file to failure", new Object[]{statusCode, getResponse.message()});
             session.transfer(flowFile, REL_FAILURE);
+            return;
         }
-        getResponse.close();
+
+        // If everything failed or we don't have a writer factory, route the entire original FF to failure.
+        if ((!failures.isEmpty() && failures.size() == recordCount ) || !writerFactoryOptional.isPresent()) {
+            flowFile = session.putAttribute(flowFile, "failure.count", Integer.toString(failures.size()));
+            session.transfer(flowFile, REL_FAILURE);
+
+        } else if (!failures.isEmpty()) {
+            // Some of the records failed and we have a writer, handle the failures individually.
+            final RecordSetWriterFactory writerFactory = writerFactoryOptional.get();
+
+            // We know there are a mixture of successes and failures, create FFs for each and rename input FF to avoid confusion.
+            final FlowFile inputFlowFile = flowFile;
+            final FlowFile successFlowFile = session.create(inputFlowFile);
+            final FlowFile failedFlowFile = session.create(inputFlowFile);
+
+            // Set up the reader and writers
+            try (final OutputStream successOut = session.write(successFlowFile);
+                 final OutputStream failedOut = session.write(failedFlowFile);
+                 final InputStream in = session.read(inputFlowFile);
+                 final RecordReader reader = readerFactory.createRecordReader(inputFlowFile, in, getLogger())) {
+
+                final RecordSchema schema = writerFactory.getSchema(inputFlowFile.getAttributes(), reader.getSchema());
+
+                try (final RecordSetWriter successWriter = writerFactory.createWriter(getLogger(), schema, successOut);
+                     final RecordSetWriter failedWriter = writerFactory.createWriter(getLogger(), schema, failedOut)) {
+
+                    successWriter.beginRecordSet();
+                    failedWriter.beginRecordSet();
+
+                    // For each record, if it's in the failure set write it to the failure FF, otherwise it succeeded.
+                    Record record;
+                    int i = 0;
+                    while ((record = reader.nextRecord(false, false)) != null) {
+                        if (failures.contains(i)) {
+                            failedWriter.write(record);
+                        } else {
+                            successWriter.write(record);
+                        }
+                        i++;
+                    }
+                }
+
+                session.putAttribute(successFlowFile, "record.count", Integer.toString(recordCount - failures.size()));
+
+                // Normal behavior is to output with record.count. In order to not break backwards compatibility, set both here.
+                session.putAttribute(failedFlowFile, "record.count", Integer.toString(failures.size()));
+                session.putAttribute(failedFlowFile, "failure.count", Integer.toString(failures.size()));
+
+                session.transfer(successFlowFile, REL_SUCCESS);
+                session.transfer(failedFlowFile, REL_FAILURE);
+                session.remove(inputFlowFile);
+
+            } catch (final IOException | SchemaNotFoundException | MalformedRecordException e) {
+                // We failed while handling individual failures. Not much else we can do other than log, and route the whole thing to failure.
+                getLogger().error("Failed to process {} during individual record failure handling; route whole FF to failure", new Object[] {flowFile, e});
+                session.transfer(inputFlowFile, REL_FAILURE);
+                if (successFlowFile != null) {
+                    session.remove(successFlowFile);
+                }
+                if (failedFlowFile != null) {
+                    session.remove(failedFlowFile);
+                }
+            }
+        }
     }
 
     private void writeRecord(final Record record, final RecordSchema writeSchema, final JsonGenerator generator)
@@ -430,7 +612,10 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
             final String fieldName = field.getFieldName();
             final Object value = record.getValue(field);
             if (value == null) {
-                generator.writeNullField(fieldName);
+                if (nullSuppression.equals(NEVER_SUPPRESS.getValue()) || (nullSuppression.equals(SUPPRESS_MISSING.getValue())) && record.getRawFieldNames().contains(fieldName)) {
+                    generator.writeNullField(fieldName);
+                }
+
                 continue;
             }
 
@@ -445,7 +630,10 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
     @SuppressWarnings("unchecked")
     private void writeValue(final JsonGenerator generator, final Object value, final String fieldName, final DataType dataType) throws IOException {
         if (value == null) {
-            generator.writeNull();
+            if (nullSuppression.equals(NEVER_SUPPRESS.getValue()) || ((nullSuppression.equals(SUPPRESS_MISSING.getValue())) && fieldName != null && !fieldName.equals(""))) {
+                generator.writeNullField(fieldName);
+            }
+
             return;
         }
 
@@ -458,7 +646,7 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
 
         switch (chosenDataType.getFieldType()) {
             case DATE: {
-                final String stringValue = DataTypeUtils.toString(coercedValue, () -> DataTypeUtils.getDateFormat(RecordFieldType.DATE.getDefaultFormat()));
+                final String stringValue = DataTypeUtils.toString(coercedValue, () -> DataTypeUtils.getDateFormat(this.dateFormat));
                 if (DataTypeUtils.isLongTypeCompatible(stringValue)) {
                     generator.writeNumber(DataTypeUtils.toLong(coercedValue, fieldName));
                 } else {
@@ -467,7 +655,7 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
                 break;
             }
             case TIME: {
-                final String stringValue = DataTypeUtils.toString(coercedValue, () -> DataTypeUtils.getDateFormat(RecordFieldType.TIME.getDefaultFormat()));
+                final String stringValue = DataTypeUtils.toString(coercedValue, () -> DataTypeUtils.getDateFormat(this.timeFormat));
                 if (DataTypeUtils.isLongTypeCompatible(stringValue)) {
                     generator.writeNumber(DataTypeUtils.toLong(coercedValue, fieldName));
                 } else {
@@ -476,7 +664,7 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
                 break;
             }
             case TIMESTAMP: {
-                final String stringValue = DataTypeUtils.toString(coercedValue, () -> DataTypeUtils.getDateFormat(RecordFieldType.TIMESTAMP.getDefaultFormat()));
+                final String stringValue = DataTypeUtils.toString(coercedValue, () -> DataTypeUtils.getDateFormat(this.timestampFormat));
                 if (DataTypeUtils.isLongTypeCompatible(stringValue)) {
                     generator.writeNumber(DataTypeUtils.toLong(coercedValue, fieldName));
                 } else {
@@ -544,7 +732,7 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
             default:
                 if (coercedValue instanceof Object[]) {
                     final Object[] values = (Object[]) coercedValue;
-                    final ArrayDataType arrayDataType = (ArrayDataType) dataType;
+                    final ArrayDataType arrayDataType = (ArrayDataType) chosenDataType;
                     final DataType elementType = arrayDataType.getElementType();
                     writeArray(values, fieldName, generator, elementType);
                 } else {

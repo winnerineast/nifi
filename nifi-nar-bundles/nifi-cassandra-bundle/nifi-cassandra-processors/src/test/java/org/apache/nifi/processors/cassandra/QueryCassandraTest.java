@@ -16,6 +16,16 @@
  */
 package org.apache.nifi.processors.cassandra;
 
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.fail;
+import static org.mockito.Matchers.any;
+import static org.mockito.Matchers.anyLong;
+import static org.mockito.Matchers.anyString;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
 import com.datastax.driver.core.Cluster;
 import com.datastax.driver.core.Configuration;
 import com.datastax.driver.core.ConsistencyLevel;
@@ -26,32 +36,21 @@ import com.datastax.driver.core.Session;
 import com.datastax.driver.core.exceptions.InvalidQueryException;
 import com.datastax.driver.core.exceptions.NoHostAvailableException;
 import com.datastax.driver.core.exceptions.ReadTimeoutException;
-import org.apache.avro.Schema;
-import org.apache.nifi.processor.exception.ProcessException;
-import org.apache.nifi.stream.io.ByteArrayOutputStream;
-import org.apache.nifi.util.MockFlowFile;
-import org.apache.nifi.util.TestRunner;
-import org.apache.nifi.util.TestRunners;
-import org.junit.Before;
-import org.junit.Test;
-
-import javax.net.ssl.SSLContext;
+import java.io.ByteArrayOutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNotNull;
-import static org.junit.Assert.fail;
-import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.anyLong;
-import static org.mockito.Matchers.anyString;
-import static org.mockito.Mockito.doReturn;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
+import javax.net.ssl.SSLContext;
+import org.apache.avro.Schema;
+import org.apache.nifi.processor.exception.ProcessException;
+import org.apache.nifi.util.MockFlowFile;
+import org.apache.nifi.util.TestRunner;
+import org.apache.nifi.util.TestRunners;
+import org.junit.Before;
+import org.junit.Test;
 
 
 public class QueryCassandraTest {
@@ -140,7 +139,7 @@ public class QueryCassandraTest {
         assertEquals("One file should be transferred to success", 1, files.size());
         assertEquals("{\"results\":[{\"user_id\":\"user1\",\"first_name\":\"Joe\",\"last_name\":\"Smith\","
                         + "\"emails\":[\"jsmith@notareal.com\"],\"top_places\":[\"New York, NY\",\"Santa Clara, CA\"],"
-                        + "\"todo\":{\"2016-01-03 05:00:00+0000\":\"Set my alarm for a month from now\"},"
+                        + "\"todo\":{\"2016-01-03 05:00:00+0000\":\"Set my alarm \\\"for\\\" a month from now\"},"
                         + "\"registered\":\"false\",\"scale\":1.0,\"metric\":2.0},"
                         + "{\"user_id\":\"user2\",\"first_name\":\"Mary\",\"last_name\":\"Jones\","
                         + "\"emails\":[\"mjones@notareal.com\"],\"top_places\":[\"Orlando, FL\"],"
@@ -177,7 +176,7 @@ public class QueryCassandraTest {
         assertEquals("One file should be transferred to success", 1, files.size());
         assertEquals("{\"results\":[{\"user_id\":\"user1\",\"first_name\":\"Joe\",\"last_name\":\"Smith\","
                         + "\"emails\":[\"jsmith@notareal.com\"],\"top_places\":[\"New York, NY\",\"Santa Clara, CA\"],"
-                        + "\"todo\":{\"2016-01-03 05:00:00+0000\":\"Set my alarm for a month from now\"},"
+                        + "\"todo\":{\"2016-01-03 05:00:00+0000\":\"Set my alarm \\\"for\\\" a month from now\"},"
                         + "\"registered\":\"false\",\"scale\":1.0,\"metric\":2.0},"
                         + "{\"user_id\":\"user2\",\"first_name\":\"Mary\",\"last_name\":\"Jones\","
                         + "\"emails\":[\"mjones@notareal.com\"],\"top_places\":[\"Orlando, FL\"],"
@@ -238,6 +237,14 @@ public class QueryCassandraTest {
         testRunner.enqueue("".getBytes());
         testRunner.run(1, true, true);
         testRunner.assertAllFlowFilesTransferred(QueryCassandra.REL_FAILURE, 1);
+    }
+
+    @Test
+    public void testCreateSchemaOneColumn() throws Exception {
+        ResultSet rs = CassandraQueryTestUtil.createMockResultSetOneColumn();
+        Schema schema = QueryCassandra.createSchema(rs);
+        assertNotNull(schema);
+        assertEquals(schema.getName(), "users");
     }
 
     @Test
@@ -378,7 +385,7 @@ public class QueryCassandraTest {
 
         @Override
         protected Cluster createCluster(List<InetSocketAddress> contactPoints, SSLContext sslContext,
-                                        String username, String password) {
+                                        String username, String password, String compressionType) {
             Cluster mockCluster = mock(Cluster.class);
             try {
                 Metadata mockMetadata = mock(Metadata.class);

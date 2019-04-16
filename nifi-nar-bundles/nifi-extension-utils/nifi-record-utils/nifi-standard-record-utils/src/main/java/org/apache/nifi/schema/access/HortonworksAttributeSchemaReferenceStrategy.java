@@ -17,14 +17,15 @@
 
 package org.apache.nifi.schema.access;
 
-import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.schemaregistry.services.SchemaRegistry;
 import org.apache.nifi.serialization.record.RecordSchema;
+import org.apache.nifi.serialization.record.SchemaIdentifier;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 
 public class HortonworksAttributeSchemaReferenceStrategy implements SchemaAccessStrategy {
@@ -33,6 +34,7 @@ public class HortonworksAttributeSchemaReferenceStrategy implements SchemaAccess
     public static final String SCHEMA_ID_ATTRIBUTE = "schema.identifier";
     public static final String SCHEMA_VERSION_ATTRIBUTE = "schema.version";
     public static final String SCHEMA_PROTOCOL_VERSION_ATTRIBUTE = "schema.protocol.version";
+
 
     private final SchemaRegistry schemaRegistry;
 
@@ -46,41 +48,46 @@ public class HortonworksAttributeSchemaReferenceStrategy implements SchemaAccess
         schemaFields.addAll(schemaRegistry == null ? Collections.emptySet() : schemaRegistry.getSuppliedSchemaFields());
     }
 
+    public boolean isFlowFileRequired() {
+        return true;
+    }
+
     @Override
-    public RecordSchema getSchema(final FlowFile flowFile, final InputStream contentStream, final RecordSchema readSchema) throws SchemaNotFoundException, IOException {
-        final String schemaIdentifier = flowFile.getAttribute(SCHEMA_ID_ATTRIBUTE);
-        final String schemaVersion = flowFile.getAttribute(SCHEMA_VERSION_ATTRIBUTE);
-        final String schemaProtocol = flowFile.getAttribute(SCHEMA_PROTOCOL_VERSION_ATTRIBUTE);
+    public RecordSchema getSchema(Map<String, String> variables, final InputStream contentStream, final RecordSchema readSchema) throws SchemaNotFoundException, IOException {
+        final String schemaIdentifier = variables.get(SCHEMA_ID_ATTRIBUTE);
+        final String schemaVersion = variables.get(SCHEMA_VERSION_ATTRIBUTE);
+        final String schemaProtocol = variables.get(SCHEMA_PROTOCOL_VERSION_ATTRIBUTE);
         if (schemaIdentifier == null || schemaVersion == null || schemaProtocol == null) {
-            throw new SchemaNotFoundException("Could not determine Schema for " + flowFile + " because it is missing one of the following three required attributes: "
+            throw new SchemaNotFoundException("Could not determine Schema for " + variables + " because it is missing one of the following three required attributes: "
                 + SCHEMA_ID_ATTRIBUTE + ", " + SCHEMA_VERSION_ATTRIBUTE + ", " + SCHEMA_PROTOCOL_VERSION_ATTRIBUTE);
         }
 
         if (!isNumber(schemaProtocol)) {
-            throw new SchemaNotFoundException("Could not determine Schema for " + flowFile + " because the " + SCHEMA_PROTOCOL_VERSION_ATTRIBUTE + " has a value of '"
+            throw new SchemaNotFoundException("Could not determine Schema for " + variables + " because the " + SCHEMA_PROTOCOL_VERSION_ATTRIBUTE + " has a value of '"
                 + schemaProtocol + "', which is not a valid Protocol Version number");
         }
 
         final int protocol = Integer.parseInt(schemaProtocol);
         if (protocol != 1) {
-            throw new SchemaNotFoundException("Could not determine Schema for " + flowFile + " because the " + SCHEMA_PROTOCOL_VERSION_ATTRIBUTE + " has a value of '"
+            throw new SchemaNotFoundException("Could not determine Schema for " + variables + " because the " + SCHEMA_PROTOCOL_VERSION_ATTRIBUTE + " has a value of '"
                 + schemaProtocol + "', which is not a valid Protocol Version number. Expected Protocol Version to be 1.");
         }
 
         if (!isNumber(schemaIdentifier)) {
-            throw new SchemaNotFoundException("Could not determine Schema for " + flowFile + " because the " + SCHEMA_ID_ATTRIBUTE + " has a value of '"
+            throw new SchemaNotFoundException("Could not determine Schema for " + variables + " because the " + SCHEMA_ID_ATTRIBUTE + " has a value of '"
                 + schemaProtocol + "', which is not a valid Schema Identifier number");
         }
 
         if (!isNumber(schemaVersion)) {
-            throw new SchemaNotFoundException("Could not determine Schema for " + flowFile + " because the " + SCHEMA_VERSION_ATTRIBUTE + " has a value of '"
+            throw new SchemaNotFoundException("Could not determine Schema for " + variables + " because the " + SCHEMA_VERSION_ATTRIBUTE + " has a value of '"
                 + schemaProtocol + "', which is not a valid Schema Version number");
         }
 
         final long schemaId = Long.parseLong(schemaIdentifier);
         final int version = Integer.parseInt(schemaVersion);
 
-        final RecordSchema schema = schemaRegistry.retrieveSchema(schemaId, version);
+        final SchemaIdentifier identifier = SchemaIdentifier.builder().id(schemaId).version(version).build();
+        final RecordSchema schema = schemaRegistry.retrieveSchema(identifier);
         if (schema == null) {
             throw new SchemaNotFoundException("Could not find a Schema in the Schema Registry with Schema Identifier '" + schemaId + "' and Version '" + version + "'");
         }

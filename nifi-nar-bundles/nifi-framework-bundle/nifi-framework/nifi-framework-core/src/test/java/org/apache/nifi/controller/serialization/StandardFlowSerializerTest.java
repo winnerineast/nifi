@@ -16,6 +16,7 @@
  */
 package org.apache.nifi.controller.serialization;
 
+import org.apache.commons.io.FileUtils;
 import org.apache.nifi.admin.service.AuditService;
 import org.apache.nifi.authorization.AbstractPolicyBasedAuthorizer;
 import org.apache.nifi.authorization.MockPolicyBasedAuthorizer;
@@ -25,16 +26,20 @@ import org.apache.nifi.controller.FlowController;
 import org.apache.nifi.controller.ProcessorNode;
 import org.apache.nifi.controller.repository.FlowFileEventRepository;
 import org.apache.nifi.encrypt.StringEncryptor;
-import org.apache.nifi.nar.ExtensionManager;
+import org.apache.nifi.nar.ExtensionDiscoveringManager;
+import org.apache.nifi.nar.StandardExtensionDiscoveringManager;
 import org.apache.nifi.nar.SystemBundle;
 import org.apache.nifi.provenance.MockProvenanceRepository;
 import org.apache.nifi.registry.VariableRegistry;
+import org.apache.nifi.registry.flow.FlowRegistryClient;
+import org.apache.nifi.registry.variable.FileBasedVariableRegistry;
 import org.apache.nifi.reporting.BulletinRepository;
-import org.apache.nifi.util.FileBasedVariableRegistry;
 import org.apache.nifi.util.NiFiProperties;
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 import org.mockito.Mockito;
+import org.w3c.dom.Document;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -43,8 +48,6 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.UUID;
-import org.apache.commons.io.FileUtils;
-import org.junit.After;
 
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -59,6 +62,7 @@ public class StandardFlowSerializerTest {
 
     private FlowController controller;
     private Bundle systemBundle;
+    private ExtensionDiscoveringManager extensionManager;
     private StandardFlowSerializer serializer;
 
     @Before
@@ -70,17 +74,22 @@ public class StandardFlowSerializerTest {
         otherProps.put("nifi.remote.input.socket.port", "");
         otherProps.put("nifi.remote.input.secure", "");
         final NiFiProperties nifiProperties = NiFiProperties.createBasicNiFiProperties(propsFile, otherProps);
-        final StringEncryptor encryptor = StringEncryptor.createEncryptor(nifiProperties);
+        final String algorithm = nifiProperties.getProperty(NiFiProperties.SENSITIVE_PROPS_ALGORITHM);
+        final String provider = nifiProperties.getProperty(NiFiProperties.SENSITIVE_PROPS_PROVIDER);
+        final String password = nifiProperties.getProperty(NiFiProperties.SENSITIVE_PROPS_KEY);
+        final StringEncryptor encryptor = StringEncryptor.createEncryptor(algorithm, provider, password);
 
         // use the system bundle
         systemBundle = SystemBundle.create(nifiProperties);
-        ExtensionManager.discoverExtensions(systemBundle, Collections.emptySet());
+        extensionManager = new StandardExtensionDiscoveringManager();
+        extensionManager.discoverExtensions(systemBundle, Collections.emptySet());
 
         final AbstractPolicyBasedAuthorizer authorizer = new MockPolicyBasedAuthorizer();
         final VariableRegistry variableRegistry = new FileBasedVariableRegistry(nifiProperties.getVariableRegistryPropertiesPaths());
 
         final BulletinRepository bulletinRepo = Mockito.mock(BulletinRepository.class);
-        controller = FlowController.createStandaloneInstance(flowFileEventRepo, nifiProperties, authorizer, auditService, encryptor, bulletinRepo, variableRegistry);
+        controller = FlowController.createStandaloneInstance(flowFileEventRepo, nifiProperties, authorizer,
+            auditService, encryptor, bulletinRepo, variableRegistry, Mockito.mock(FlowRegistryClient.class), extensionManager);
 
         serializer = new StandardFlowSerializer(encryptor);
     }
@@ -93,13 +102,16 @@ public class StandardFlowSerializerTest {
 
     @Test
     public void testSerializationEscapingAndFiltering() throws Exception {
-        final ProcessorNode dummy = controller.createProcessor(DummyScheduledProcessor.class.getName(), UUID.randomUUID().toString(), systemBundle.getBundleDetails().getCoordinate());
+        final ProcessorNode dummy = controller.getFlowManager().createProcessor(DummyScheduledProcessor.class.getName(),
+            UUID.randomUUID().toString(), systemBundle.getBundleDetails().getCoordinate());
+
         dummy.setComments(RAW_COMMENTS);
-        controller.getRootGroup().addProcessor(dummy);
+        controller.getFlowManager().getRootGroup().addProcessor(dummy);
 
         // serialize the controller
         final ByteArrayOutputStream os = new ByteArrayOutputStream();
-        serializer.serialize(controller, os, ScheduledStateLookup.IDENTITY_LOOKUP);
+        final Document doc = serializer.transform(controller, ScheduledStateLookup.IDENTITY_LOOKUP);
+        serializer.serialize(doc, os);
 
         // verify the results contain the serialized string
         final String serializedFlow = os.toString(StandardCharsets.UTF_8.name());

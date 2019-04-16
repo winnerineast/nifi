@@ -21,12 +21,12 @@ import org.apache.nifi.cluster.manager.NodeResponse;
 import org.apache.nifi.cluster.protocol.NodeIdentifier;
 import org.apache.nifi.controller.status.ProcessorStatus;
 import org.apache.nifi.controller.status.history.ConnectionStatusDescriptor;
+import org.apache.nifi.controller.status.history.CounterMetricDescriptor;
 import org.apache.nifi.controller.status.history.MetricDescriptor;
 import org.apache.nifi.controller.status.history.MetricDescriptor.Formatter;
 import org.apache.nifi.controller.status.history.ProcessGroupStatusDescriptor;
 import org.apache.nifi.controller.status.history.ProcessorStatusDescriptor;
 import org.apache.nifi.controller.status.history.RemoteProcessGroupStatusDescriptor;
-import org.apache.nifi.controller.status.history.StandardMetricDescriptor;
 import org.apache.nifi.controller.status.history.StandardStatusSnapshot;
 import org.apache.nifi.controller.status.history.StatusHistoryUtil;
 import org.apache.nifi.controller.status.history.StatusSnapshot;
@@ -41,6 +41,7 @@ import java.net.URI;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -102,7 +103,7 @@ public class StatusHistoryEndpointMerger implements EndpointResponseMerger {
     public NodeResponse merge(URI uri, String method, Set<NodeResponse> successfulResponses, Set<NodeResponse> problematicResponses, NodeResponse clientResponse) {
         final Map<String, MetricDescriptor<?>> metricDescriptors = getStandardMetricDescriptors(uri);
 
-        final StatusHistoryEntity responseEntity = clientResponse.getClientResponse().getEntity(StatusHistoryEntity.class);
+        final StatusHistoryEntity responseEntity = clientResponse.getClientResponse().readEntity(StatusHistoryEntity.class);
 
         final Set<StatusDescriptorDTO> fieldDescriptors = new LinkedHashSet<>();
 
@@ -111,7 +112,7 @@ public class StatusHistoryEndpointMerger implements EndpointResponseMerger {
         final List<NodeStatusSnapshotsDTO> nodeStatusSnapshots = new ArrayList<>(successfulResponses.size());
         LinkedHashMap<String, String> noReadPermissionsComponentDetails = null;
         for (final NodeResponse nodeResponse : successfulResponses) {
-            final StatusHistoryEntity nodeResponseEntity = nodeResponse == clientResponse ? responseEntity : nodeResponse.getClientResponse().getEntity(StatusHistoryEntity.class);
+            final StatusHistoryEntity nodeResponseEntity = nodeResponse == clientResponse ? responseEntity : nodeResponse.getClientResponse().readEntity(StatusHistoryEntity.class);
             final StatusHistoryDTO nodeStatus = nodeResponseEntity.getStatusHistory();
             lastStatusHistory = nodeStatus;
             if (noReadPermissionsComponentDetails == null && !nodeResponseEntity.getCanRead()) {
@@ -156,9 +157,8 @@ public class StatusHistoryEndpointMerger implements EndpointResponseMerger {
                         return counters.getOrDefault(descriptorDto.getField(), 0L);
                     };
 
-                    final MetricDescriptor<ProcessorStatus> metricDescriptor = new StandardMetricDescriptor<>(descriptorDto.getField(),
-                        descriptorDto.getLabel(), descriptorDto.getDescription(), Formatter.COUNT, valueMapper);
-
+                    final MetricDescriptor<ProcessorStatus> metricDescriptor = new CounterMetricDescriptor<>(descriptorDto.getField(), descriptorDto.getLabel(),
+                        descriptorDto.getDescription(), Formatter.COUNT, valueMapper);
                     metricDescriptors.put(fieldName, metricDescriptor);
                 }
             }
@@ -197,11 +197,7 @@ public class StatusHistoryEndpointMerger implements EndpointResponseMerger {
                 final StatusSnapshot snapshot = createSnapshot(snapshotDto, metricDescriptors);
                 final Date normalizedDate = normalizeStatusSnapshotDate(snapshot.getTimestamp(), componentStatusSnapshotMillis);
 
-                Map<String, StatusSnapshot> nodeToSnapshotMap = dateToNodeSnapshots.get(normalizedDate);
-                if (nodeToSnapshotMap == null) {
-                    nodeToSnapshotMap = new HashMap<>();
-                    dateToNodeSnapshots.put(normalizedDate, nodeToSnapshotMap);
-                }
+                Map<String, StatusSnapshot> nodeToSnapshotMap = dateToNodeSnapshots.computeIfAbsent(normalizedDate, k -> new HashMap<>());
                 nodeToSnapshotMap.put(nodeStatusSnapshot.getNodeId(), snapshot);
             }
         }
@@ -220,7 +216,7 @@ public class StatusHistoryEndpointMerger implements EndpointResponseMerger {
     }
 
     private StatusSnapshot createSnapshot(final StatusSnapshotDTO snapshotDto, final Map<String, MetricDescriptor<?>> metricDescriptors) {
-        final StandardStatusSnapshot snapshot = new StandardStatusSnapshot();
+        final StandardStatusSnapshot snapshot = new StandardStatusSnapshot(new HashSet<>(metricDescriptors.values()));
         snapshot.setTimestamp(snapshotDto.getTimestamp());
 
         // Default all metrics to 0 so that if a counter has not yet been registered, it will have a value of 0 instead
@@ -250,11 +246,24 @@ public class StatusHistoryEndpointMerger implements EndpointResponseMerger {
         return snapshot;
     }
 
-    private List<StatusSnapshotDTO> aggregate(Map<Date, List<StatusSnapshot>> snapshotsToAggregate) {
+    private List<StatusSnapshotDTO> aggregate(final Map<Date, List<StatusSnapshot>> snapshotsToAggregate) {
         // Aggregate the snapshots
         final List<StatusSnapshotDTO> aggregatedSnapshotDtos = new ArrayList<>();
+
+        int iteration = 0;
+        int previousSnapshotCount = 0;
         for (final Map.Entry<Date, List<StatusSnapshot>> entry : snapshotsToAggregate.entrySet()) {
             final List<StatusSnapshot> snapshots = entry.getValue();
+
+            // If this is the last snapshot, we don't want to include it unless we have stats from all nodes.
+            // Otherwise, when we look at the stats in a chart, the last point for the cluster stats often seems to
+            // drop off very steeply.
+            if (++iteration == snapshotsToAggregate.size() && snapshots.size() < previousSnapshotCount) {
+                continue;
+            }
+
+            previousSnapshotCount = snapshots.size();
+
             final StatusSnapshot reducedSnapshot = snapshots.get(0).getValueReducer().reduce(snapshots);
 
             final StatusSnapshotDTO dto = new StatusSnapshotDTO();

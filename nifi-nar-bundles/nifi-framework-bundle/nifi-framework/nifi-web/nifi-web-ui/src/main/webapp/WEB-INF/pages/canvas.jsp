@@ -46,7 +46,8 @@
         </script>
         <script type="text/javascript" src="assets/url-search-params/build/url-search-params.js"></script>
         <script type="text/javascript" src="js/codemirror/lib/codemirror-compressed.js"></script>
-        <script type="text/javascript" src="assets/d3/d3.min.js"></script>
+        <script type="text/javascript" src="assets/d3/build/d3.min.js"></script>
+        <script type="text/javascript" src="assets/d3-selection-multi/build/d3-selection-multi.min.js"></script>
         <script type="text/javascript" src="assets/jquery/dist/jquery.min.js"></script>
         <script type="text/javascript" src="assets/jquery-ui-dist/jquery-ui.min.js"></script>
         <script type="text/javascript" src="js/jquery/jquery.base64.js"></script>
@@ -59,6 +60,7 @@
         <script type="text/javascript" src="js/jquery/combo/jquery.combo.js?${project.version}"></script>
         <script type="text/javascript" src="js/jquery/modal/jquery.modal.js?${project.version}"></script>
         <script type="text/javascript" src="assets/jquery-minicolors/jquery.minicolors.min.js"></script>
+        <script type="text/javascript" src="assets/lodash-core/distrib/lodash-core.min.js"></script>
         <script type="text/javascript" src="assets/qtip2/dist/jquery.qtip.min.js"></script>
         <script type="text/javascript" src="assets/slickgrid/lib/jquery.event.drag-2.3.0.js"></script>
         <script type="text/javascript" src="assets/slickgrid/plugins/slick.cellrangeselector.js"></script>
@@ -115,6 +117,11 @@
         <jsp:include page="/WEB-INF/partials/canvas/instantiate-template-dialog.jsp"/>
         <jsp:include page="/WEB-INF/partials/canvas/fill-color-dialog.jsp"/>
         <jsp:include page="/WEB-INF/partials/canvas/connections-dialog.jsp"/>
+        <jsp:include page="/WEB-INF/partials/canvas/save-flow-version-dialog.jsp"/>
+        <jsp:include page="/WEB-INF/partials/canvas/import-flow-version-dialog.jsp"/>
+        <jsp:include page="/WEB-INF/partials/canvas/revert-local-changes-dialog.jsp"/>
+        <jsp:include page="/WEB-INF/partials/canvas/show-local-changes-dialog.jsp"/>
+        <jsp:include page="/WEB-INF/partials/canvas/registry-configuration-dialog.jsp"/>
         <div id="canvas-container" class="unselectable"></div>
         <div id="canvas-tooltips">
             <div id="processor-tooltips"></div>
@@ -129,6 +136,7 @@
         <jsp:include page="/WEB-INF/partials/canvas/reporting-task-configuration.jsp"/>
         <jsp:include page="/WEB-INF/partials/canvas/processor-configuration.jsp"/>
         <jsp:include page="/WEB-INF/partials/processor-details.jsp"/>
+        <jsp:include page="/WEB-INF/partials/canvas/variable-configuration.jsp"/>
         <jsp:include page="/WEB-INF/partials/canvas/process-group-configuration.jsp"/>
         <jsp:include page="/WEB-INF/partials/canvas/override-policy-dialog.jsp"/>
         <jsp:include page="/WEB-INF/partials/canvas/policy-management.jsp"/>

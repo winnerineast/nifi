@@ -404,12 +404,16 @@ public class FileSystemRepository implements ContentRepository {
     @Override
     public long getContainerCapacity(final String containerName) throws IOException {
         final Path path = containers.get(containerName);
+
         if (path == null) {
             throw new IllegalArgumentException("No container exists with name " + containerName);
         }
-        long capacity = path.toFile().getTotalSpace();
+
+        long capacity = FileUtils.getContainerCapacity(path);
+
         if(capacity==0) {
-            throw new IOException("System returned total space of the partition for " + containerName + " is zero byte. Nifi can not create a zero sized FileSystemRepository");
+            throw new IOException("System returned total space of the partition for " + containerName + " is zero byte. "
+                    + "Nifi can not create a zero sized FileSystemRepository.");
         }
 
         return capacity;
@@ -418,10 +422,22 @@ public class FileSystemRepository implements ContentRepository {
     @Override
     public long getContainerUsableSpace(String containerName) throws IOException {
         final Path path = containers.get(containerName);
+
         if (path == null) {
             throw new IllegalArgumentException("No container exists with name " + containerName);
         }
-        return path.toFile().getUsableSpace();
+
+        return FileUtils.getContainerUsableSpace(path);
+    }
+
+    @Override
+    public String getContainerFileStoreName(final String containerName) {
+        final Path path = containers.get(containerName);
+        try {
+            return Files.getFileStore(path).name();
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     @Override
@@ -509,7 +525,7 @@ public class FileSystemRepository implements ContentRepository {
         return containerPath.resolve(resourceClaim.getSection()).resolve(resourceClaim.getId());
     }
 
-    private Path getPath(final ContentClaim claim, final boolean verifyExists) throws ContentNotFoundException {
+    public Path getPath(final ContentClaim claim, final boolean verifyExists) throws ContentNotFoundException {
         final ResourceClaim resourceClaim = claim.getResourceClaim();
         final Path containerPath = containers.get(resourceClaim.getContainer());
         if (containerPath == null) {
@@ -562,7 +578,7 @@ public class FileSystemRepository implements ContentRepository {
             }
 
             final long modulatedSectionIndex = currentIndex % SECTIONS_PER_CONTAINER;
-            final String section = String.valueOf(modulatedSectionIndex);
+            final String section = String.valueOf(modulatedSectionIndex).intern();
             final String claimId = System.currentTimeMillis() + "-" + currentIndex;
 
             resourceClaim = resourceClaimManager.newResourceClaim(containerName, section, claimId, lossTolerant, true);
@@ -848,9 +864,16 @@ public class FileSystemRepository implements ContentRepository {
 
         }
 
-        // see javadocs for claim.getLength() as to why we do this.
+        // A claim length of -1 indicates that the claim is still being written to and we don't know
+        // the length. In this case, we don't limit the Input Stream. If the Length has been populated, though,
+        // it is possible that the Length could then be extended. However, we do want to avoid ever allowing the
+        // stream to read past the end of the Content Claim. To accomplish this, we use a LimitedInputStream but
+        // provide a LongSupplier for the length instead of a Long value. this allows us to continue reading until
+        // we get to the end of the Claim, even if the Claim grows. This may happen, for instance, if we obtain an
+        // InputStream for this claim, then read from it, write more to the claim, and then attempt to read again. In
+        // such a case, since we have written to that same Claim, we should still be able to read those bytes.
         if (claim.getLength() >= 0) {
-            return new LimitedInputStream(fis, claim.getLength());
+            return new LimitedInputStream(fis, claim::getLength);
         } else {
             return fis;
         }

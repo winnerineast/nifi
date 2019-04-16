@@ -145,7 +145,7 @@
             {
                 id: 'processors',
                 field: 'processors',
-                name: 'Processors',
+                name: 'Cores',
                 sortable: true,
                 resizable: true,
                 cssClass: 'cell-right',
@@ -155,7 +155,7 @@
             {
                 id: 'processorLoadAverage',
                 field: 'processorLoadAverage',
-                name: 'Processor Load Average',
+                name: 'Core Load Average',
                 sortable: true,
                 resizable: true,
                 cssClass: 'cell-right',
@@ -352,6 +352,89 @@
         }]
     };
 
+    var provenanceTab = {
+        name: 'Provenance Storage',
+        data: {
+            dataSet: 'systemDiagnostics',
+            update: updateProvenanceTableData
+        },
+        tabContentId: 'cluster-provenance-tab-content',
+        tableId: 'cluster-provenance-table',
+        tableColumnModel: [
+            {
+                id: 'node',
+                field: 'node',
+                name: 'Node Address',
+                sortable: true,
+                resizable: true,
+                formatter: nfCommon.genericValueFormatter
+            },
+            {
+                id: 'provenanceRepoId',
+                field: 'provenanceRepoId',
+                name: 'Provenance Repository',
+                sortable: true,
+                resizable: true,
+                formatter: nfCommon.genericValueFormatter
+            },
+            {
+                id: 'provenanceRepoTotal',
+                field: 'provenanceRepoTotal',
+                name: 'Total Space',
+                sortable: true,
+                resizable: true,
+                cssClass: 'cell-right',
+                headerCssClass: 'header-right',
+                formatter: nfCommon.genericValueFormatter
+            },
+            {
+                id: 'provenanceRepoUsed',
+                field: 'provenanceRepoUsed',
+                name: 'Used Space',
+                sortable: true,
+                resizable: true,
+                cssClass: 'cell-right',
+                headerCssClass: 'header-right',
+                formatter: nfCommon.genericValueFormatter
+            },
+            {
+                id: 'provenanceRepoFree',
+                field: 'provenanceRepoFree',
+                name: 'Free Space',
+                sortable: true,
+                resizable: true,
+                cssClass: 'cell-right',
+                headerCssClass: 'header-right',
+                formatter: nfCommon.genericValueFormatter
+            },
+            {
+                id: 'provenanceRepoUtil',
+                field: 'provenanceRepoUtil',
+                name: 'Utilization',
+                sortable: true,
+                resizable: true,
+                cssClass: 'cell-right',
+                headerCssClass: 'header-right',
+                formatter: nfCommon.genericValueFormatter
+            }
+        ],
+        tableIdColumn: 'id',
+        tableOptions: commonTableOptions,
+        tableOnClick: null,
+        createTableOnEnter: null,
+        cleanUpTable: null,
+        init: commonTableInit,
+        onSort: sort,
+        onTabSelected: onSelectTab,
+        filterOptions: [{
+            text: 'by address',
+            value: 'node'
+        }, {
+            text: 'by repository',
+            value: 'contentRepoId'
+        }]
+    };
+
     var versionTab = {
         name: 'Versions',
         data: {
@@ -432,7 +515,7 @@
         }]
     };
 
-    var clusterTabs = [nodesTab, systemTab, jvmTab, flowFileTab, contentTab, versionTab];
+    var clusterTabs = [nodesTab, systemTab, jvmTab, flowFileTab, contentTab, provenanceTab, versionTab];
     var tabsByName = {};
     var dataSetHandlers = {};
 
@@ -445,6 +528,8 @@
                 promptForConnect(item);
             } else if (target.hasClass('prompt-for-removal')) {
                 promptForRemoval(item);
+            } else if (target.hasClass('prompt-for-offload')) {
+                promptForOffload(item);
             } else if (target.hasClass('prompt-for-disconnect')) {
                 promptForDisconnect(item);
             }
@@ -460,7 +545,7 @@
      */
     function createNodeTableColumnModel() {
         var moreDetailsFormatter = function (row, cell, value, columnDef, dataContext) {
-            return '<div title="View Details" class="pointer show-node-details fa fa-info-circle" style="margin-top: 2px;"></div>';
+            return '<div title="View Details" class="pointer show-node-details fa fa-info-circle"></div>';
         };
 
         // define a custom formatter for the run status column
@@ -545,24 +630,25 @@
         // only allow the admin to modify the cluster
         if (nfCommon.canModifyController()) {
             var actionFormatter = function (row, cell, value, columnDef, dataContext) {
-                var canDisconnect = false;
-                var canConnect = false;
+                var connectDiv = '<div title="Connect" class="pointer prompt-for-connect fa fa-plug"></div>';
+                var deleteDiv = '<div title="Delete" class="pointer prompt-for-removal fa fa-trash"></div>';
+                var disconnectDiv = '<div title="Disconnect" class="pointer prompt-for-disconnect fa fa-power-off"></div>';
+                var offloadDiv = '<div title="Offload" class="pointer prompt-for-offload fa fa-rotate-90 fa-upload" ' +
+                    'style="margin-top: 5px;margin-left: 5px;margin-right: -2px;"></div>';
+                var markup = '';
 
-                // determine the current status
+                // determine the current status and create the appropriate markup
                 if (dataContext.status === 'CONNECTED' || dataContext.status === 'CONNECTING') {
-                    canDisconnect = true;
+                    markup += disconnectDiv;
                 } else if (dataContext.status === 'DISCONNECTED') {
-                    canConnect = true;
+                    markup += connectDiv + offloadDiv + deleteDiv;
+                } else if (dataContext.status === 'OFFLOADED') {
+                    markup += connectDiv + deleteDiv;
+                } else {
+                    markup += '<div style="width: 16px; height: 16px;">&nbsp;</div>';
                 }
 
-                // return the appropriate markup
-                if (canConnect) {
-                    return '<div title="Connect" class="pointer prompt-for-connect fa fa-plug" style="margin-top: 2px;"></div><div title="Delete" class="pointer prompt-for-removal fa fa-trash" style="margin-top: 2px;"></div>';
-                } else if (canDisconnect) {
-                    return '<div title="Disconnect" class="pointer prompt-for-disconnect fa fa-power-off" style="margin-top: 2px;"></div>';
-                } else {
-                    return '<div style="width: 16px; height: 16px;">&nbsp;</div>';
-                }
+                return markup;
             };
 
             columnModel.push({
@@ -622,7 +708,7 @@
 
     function createJvmTableColumnModel() {
         var gcFormatter = function (row, cell, value, columnDef, dataContext) {
-            return '<div class="pointer show-jvm-gc fa fa-question-circle" style="margin-top: 2px;"></div><span class="hidden row-id">' + nfCommon.escapeHtml(dataContext.id) + '</span>';
+            return '<div class="pointer show-jvm-gc fa fa-question-circle"></div><span class="hidden row-id">' + nfCommon.escapeHtml(dataContext.id) + '</span>';
         };
 
         return [
@@ -847,6 +933,50 @@
                 'status': 'CONNECTING'
             }
         };
+        $.ajax({
+            type: 'PUT',
+            url: config.urls.nodes + '/' + encodeURIComponent(nodeId),
+            data: JSON.stringify(entity),
+            dataType: 'json',
+            contentType: 'application/json'
+        }).done(function (response) {
+            var node = response.node;
+
+            // update the node in the table
+            var clusterGrid = $('#cluster-nodes-table').data('gridInstance');
+            var clusterData = clusterGrid.getData();
+            clusterData.updateItem(node.nodeId, node);
+        }).fail(nfErrorHandler.handleAjaxError);
+    };
+
+    /**
+     * Prompts to verify node offload.
+     *
+     * @argument {object} node     The node
+     */
+    var promptForOffload = function (node) {
+        nfDialog.showYesNoDialog({
+            headerText: 'Offload Node',
+            dialogContent: 'Offload \'' + formatNodeAddress(node) + '\'?',
+            yesHandler: function () {
+                offload(node.nodeId);
+            }
+        });
+    };
+
+    /**
+     * Offloads the node in the specified row.
+     *
+     * @argument {string} nodeId     The node id
+     */
+    var offload = function (nodeId) {
+        var entity = {
+            'node': {
+                'nodeId': nodeId,
+                'status': 'OFFLOADING'
+            }
+        };
+
         $.ajax({
             type: 'PUT',
             url: config.urls.nodes + '/' + encodeURIComponent(nodeId),
@@ -1197,6 +1327,39 @@
             contentTab.grid.invalidate();
         } else {
             contentTab.rowCount = 0;
+        }
+    }
+
+    /**
+     * Applies system diagnostics data to the Provenance Storage tab.
+     */
+    function updateProvenanceTableData(systemDiagnosticsResponse) {
+        if (nfCommon.isDefinedAndNotNull(systemDiagnosticsResponse.systemDiagnostics)
+            && nfCommon.isDefinedAndNotNull(systemDiagnosticsResponse.systemDiagnostics.nodeSnapshots)) {
+
+            var provenanceStorageTableRows = [];
+            systemDiagnosticsResponse.systemDiagnostics.nodeSnapshots.forEach(function (nodeSnapshot) {
+                var snapshot = nodeSnapshot.snapshot;
+                snapshot.provenanceRepositoryStorageUsage.forEach(function (provenanceRepoUsage) {
+                	provenanceStorageTableRows.push({
+                        id: nodeSnapshot.nodeId + ':' + provenanceRepoUsage.identifier,
+                        address: nodeSnapshot.address,
+                        node: nodeSnapshot.address + ':' + nodeSnapshot.apiPort,
+                        provenanceRepoId: provenanceRepoUsage.identifier,
+                        provenanceRepoTotal: provenanceRepoUsage.totalSpace,
+                        provenanceRepoUsed: provenanceRepoUsage.usedSpace,
+                        provenanceRepoFree: provenanceRepoUsage.freeSpace,
+                        provenanceRepoUtil: provenanceRepoUsage.utilization
+                    });
+                });
+            });
+
+            provenanceTab.rowCount = provenanceStorageTableRows.length;
+            provenanceTab.dataView.setItems(provenanceStorageTableRows);
+            provenanceTab.dataView.reSort();
+            provenanceTab.grid.invalidate();
+        } else {
+        	provenanceTab.rowCount = 0;
         }
     }
 

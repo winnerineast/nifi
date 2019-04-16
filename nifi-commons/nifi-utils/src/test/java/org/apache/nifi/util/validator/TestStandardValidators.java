@@ -16,18 +16,18 @@
  */
 package org.apache.nifi.util.validator;
 
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-import static org.mockito.Mockito.mock;
-
-import java.util.concurrent.TimeUnit;
-
 import org.apache.nifi.components.ValidationContext;
 import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.components.Validator;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.junit.Test;
 import org.mockito.Mockito;
+
+import java.util.concurrent.TimeUnit;
+
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+import static org.mockito.Mockito.mock;
 
 public class TestStandardValidators {
 
@@ -286,6 +286,26 @@ public class TestStandardValidators {
         assertFalse(vr.isValid());
 
         vr = val.validate("foo", "2016-01-01T01:01:01.000Z", vc);
+        assertTrue(vr.isValid());
+    }
+
+    @Test
+    public void testURIListValidator() {
+        Validator val = StandardValidators.URI_LIST_VALIDATOR;
+        ValidationContext vc = mock(ValidationContext.class);
+        ValidationResult vr = val.validate("foo", null, vc);
+        assertFalse(vr.isValid());
+
+        vr = val.validate("foo", "", vc);
+        assertFalse(vr.isValid());
+
+        vr = val.validate("foo", "/no_scheme", vc);
+        assertTrue(vr.isValid());
+
+        vr = val.validate("foo", "http://localhost 8080, https://host2:8080 ", vc);
+        assertFalse(vr.isValid());
+
+        vr = val.validate("foo", "http://localhost , https://host2:8080 ", vc);
         assertTrue(vr.isValid());
     }
 }

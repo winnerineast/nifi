@@ -22,20 +22,23 @@
     if (typeof define === 'function' && define.amd) {
         define(['jquery',
                 'd3',
-                'nf.Storage'],
-            function ($, d3, nfStorage) {
-                return (nf.Common = factory($, d3, nfStorage));
+                'nf.Storage',
+                'lodash-core'],
+            function ($, d3, nfStorage, _) {
+                return (nf.Common = factory($, d3, nfStorage, _));
             });
     } else if (typeof exports === 'object' && typeof module === 'object') {
         module.exports = (nf.Common = factory(require('jquery'),
             require('d3'),
-            require('nf.Storage')));
+            require('nf.Storage'),
+            require('lodash-core')));
     } else {
         nf.Common = factory(root.$,
             root.d3,
-            root.nf.Storage);
+            root.nf.Storage,
+            root._);
     }
-}(this, function ($, d3, nfStorage) {
+}(this, function ($, d3, nfStorage, _) {
     'use strict';
 
     $(document).ready(function () {
@@ -61,12 +64,15 @@
             } else {
                 checkbox.removeClass('checkbox-checked').addClass('checkbox-unchecked');
             }
+            // emit a state change event
+            checkbox.trigger('change');
         });
 
         // setup click areas for custom checkboxes
         $(document).on('click', '.nf-checkbox-label', function (e) {
             $(e.target).parent().find('.nf-checkbox').click();
         });
+
 
         // show the loading icon when appropriate
         $(document).ajaxStart(function () {
@@ -86,7 +92,7 @@
         // handle logout
         $('#user-logout').on('click', function () {
             nfStorage.removeItem('jwt');
-            window.location = '../nifi/login';
+            window.location = '../nifi/logout';
         });
 
         // handle home
@@ -117,7 +123,7 @@
     }, {
         text: 'access restricted components',
         value: 'restricted-components',
-        description: 'Allows users to create/modify restricted components assuming otherwise sufficient permissions'
+        description: 'Allows users to create/modify restricted components assuming other permissions are sufficient'
     }, {
         text: 'access all policies',
         value: 'policies',
@@ -313,7 +319,7 @@
             var markup = '';
 
             // restriction
-            if (nfCommon.isBlank(dataContext.usageRestriction) === false) {
+            if (dataContext.restricted === true) {
                 markup += '<div class="view-usage-restriction fa fa-shield"></div><span class="hidden row-id">' + nfCommon.escapeHtml(dataContext.id) + '</span>';
             } else {
                 markup += '<div class="fa"></div>';
@@ -373,7 +379,7 @@
             }
 
             if (!nfCommon.isEmpty(dataContext.controllerServiceApis)) {
-                markup += '<div class="controller-service-apis fa fa-list" title="Compatible Controller Service" style="margin-top: 2px; margin-left: 4px;"></div><span class="hidden row-id">' + nfCommon.escapeHtml(dataContext.id) + '</span>';
+                markup += '<div class="controller-service-apis fa fa-list" title="Compatible Controller Service" style="margin-left: 4px;"></div><span class="hidden row-id">' + nfCommon.escapeHtml(dataContext.id) + '</span>';
             }
 
             markup += '<div class="clear"></div>';
@@ -418,12 +424,30 @@
         },
 
         /**
+         * Gets the version control tooltip.
+         *
+         * @param versionControlInformation
+         */
+        getVersionControlTooltip: function (versionControlInformation) {
+            return versionControlInformation.stateExplanation;
+        },
+
+        /**
+         * Formats the class name of this component.
+         *
+         * @param dataContext component datum
+         */
+        formatClassName: function (dataContext) {
+            return nfCommon.substringAfterLast(dataContext.type, '.');
+        },
+
+        /**
          * Formats the type of this component.
          *
          * @param dataContext component datum
          */
         formatType: function (dataContext) {
-            var typeString = nfCommon.substringAfterLast(dataContext.type, '.');
+            var typeString = nfCommon.formatClassName(dataContext);
             if (dataContext.bundle.version !== 'unversioned') {
                 typeString += (' ' + dataContext.bundle.version);
             }
@@ -546,6 +570,17 @@
         },
 
         /**
+         * Determines whether the current user can version flows.
+         */
+        canVersionFlows: function () {
+            if (nfCommon.isDefinedAndNotNull(nfCommon.currentUser)) {
+                return nfCommon.currentUser.canVersionFlows === true;
+            } else {
+                return false;
+            }
+        },
+
+        /**
          * Determines whether the current user can access provenance.
          *
          * @returns {boolean}
@@ -559,13 +594,63 @@
         },
 
         /**
-         * Determines whether the current user can access restricted comopnents.
+         * Determines whether the current user can access restricted components.
          *
          * @returns {boolean}
          */
         canAccessRestrictedComponents: function () {
             if (nfCommon.isDefinedAndNotNull(nfCommon.currentUser)) {
                 return nfCommon.currentUser.restrictedComponentsPermissions.canWrite === true;
+            } else {
+                return false;
+            }
+        },
+
+        /**
+         * Determines whether the current user can access the specific explicit component restrictions.
+         *
+         * @param {object} explicitRestrictions
+         * @returns {boolean}
+         */
+        canAccessComponentRestrictions: function (explicitRestrictions) {
+            if (nfCommon.isDefinedAndNotNull(nfCommon.currentUser)) {
+                if (nfCommon.currentUser.restrictedComponentsPermissions.canWrite === true) {
+                    return true;
+                }
+
+                var satisfiesRequiredPermission = function (requiredPermission) {
+                    if (nfCommon.isEmpty(nfCommon.currentUser.componentRestrictionPermissions)) {
+                        return false;
+                    }
+
+                    var hasPermission = false;
+
+                    $.each(nfCommon.currentUser.componentRestrictionPermissions, function (_, componentRestrictionPermission) {
+                        if (componentRestrictionPermission.requiredPermission.id === requiredPermission.id) {
+                            if (componentRestrictionPermission.permissions.canWrite === true) {
+                                hasPermission = true;
+                                return false;
+                            }
+                        }
+                    });
+
+                    return hasPermission;
+                };
+
+                var satisfiesRequiredPermissions = true;
+
+                if (nfCommon.isEmpty(explicitRestrictions)) {
+                    satisfiesRequiredPermissions = false;
+                } else {
+                    $.each(explicitRestrictions, function (_, explicitRestriction) {
+                        if (!satisfiesRequiredPermission(explicitRestriction.requiredPermission)) {
+                            satisfiesRequiredPermissions = false;
+                            return false;
+                        }
+                    });
+                }
+
+                return satisfiesRequiredPermissions;
             } else {
                 return false;
             }
@@ -819,7 +904,7 @@
                     tipContent.push('<b>Default value:</b> ' + nfCommon.escapeHtml(propertyDescriptor.defaultValue));
                 }
                 if (!nfCommon.isBlank(propertyDescriptor.supportsEl)) {
-                    tipContent.push('<b>Supports expression language:</b> ' + nfCommon.escapeHtml(propertyDescriptor.supportsEl));
+                    tipContent.push('<b>Expression language scope:</b> ' + nfCommon.escapeHtml(propertyDescriptor.expressionLanguageScope));
                 }
                 if (!nfCommon.isBlank(propertyDescriptor.identifiesControllerService)) {
                     var formattedType = nfCommon.formatType({
@@ -991,7 +1076,7 @@
         },
 
         /**
-         * Extracts the contents of the specified str after the strToFind. If the
+         * Extracts the contents of the specified str after the last strToFind. If the
          * strToFind is not found or the last part of the str, an empty string is
          * returned.
          *
@@ -1031,8 +1116,25 @@
         },
 
         /**
-         * Extracts the contents of the specified str before the strToFind. If the
+         * Extracts the contents of the specified str before the last strToFind. If the
          * strToFind is not found or the first part of the str, an empty string is
+         * returned.
+         *
+         * @argument {string} str       The full string
+         * @argument {string} strToFind The substring to find
+         */
+        substringBeforeLast: function (str, strToFind) {
+            var result = '';
+            var indexOfStrToFind = str.lastIndexOf(strToFind);
+            if (indexOfStrToFind >= 0) {
+                result = str.substr(0, indexOfStrToFind);
+            }
+            return result;
+        },
+
+        /**
+         * Extracts the contents of the specified str before the strToFind. If the
+         * strToFind is not found or the first path of the str, an empty string is
          * returned.
          *
          * @argument {string} str       The full string
@@ -1091,6 +1193,42 @@
         MILLIS_PER_HOUR: 3600000,
         MILLIS_PER_MINUTE: 60000,
         MILLIS_PER_SECOND: 1000,
+
+        /**
+         * Constants for combo options.
+         */
+        loadBalanceStrategyOptions: [{
+                text: 'Do not load balance',
+                value: 'DO_NOT_LOAD_BALANCE',
+                description: 'Do not load balance FlowFiles between nodes in the cluster.'
+            }, {
+                text: 'Partition by attribute',
+                value: 'PARTITION_BY_ATTRIBUTE',
+                description: 'Determine which node to send a given FlowFile to based on the value of a user-specified FlowFile Attribute.'
+                                + ' All FlowFiles that have the same value for said Attribute will be sent to the same node in the cluster.'
+            }, {
+                text: 'Round robin',
+                value: 'ROUND_ROBIN',
+                description: 'FlowFiles will be distributed to nodes in the cluster in a Round-Robin fashion.'
+            }, {
+                text: 'Single node',
+                value: 'SINGLE_NODE',
+                description: 'All FlowFiles will be sent to the same node. Which node they are sent to is not defined.'
+        }],
+
+        loadBalanceCompressionOptions: [{
+                text: 'Do not compress',
+                value: 'DO_NOT_COMPRESS',
+                description: 'FlowFiles will not be compressed'
+            }, {
+                text: 'Compress attributes only',
+                value: 'COMPRESS_ATTRIBUTES_ONLY',
+                description: 'FlowFiles\' attributes will be compressed, but the FlowFiles\' contents will not be'
+            }, {
+                text: 'Compress attributes and content',
+                value: 'COMPRESS_ATTRIBUTES_AND_CONTENT',
+                description: 'FlowFiles\' attributes and content will be compressed'
+        }],
 
         /**
          * Formats the specified duration.
@@ -1541,7 +1679,43 @@
                 })
                 .map(policyTypeListing, d3.map);
             return nest.get(value)[0];
+        },
+
+        /**
+         * Get component name from an entity safely.
+         *
+         * @param {object} entity    The component entity
+         * @returns {String}         The component name if it can be read, otherwise entity id
+         */
+        getComponentName: function (entity) {
+            return entity.permissions.canRead === true ? entity.component.name : entity.id;
+        },
+
+        /**
+         * Find the corresponding combo option text from a combo option values.
+         *
+         * @param {object} options    The combo option array
+         * @param {string} value      The target value
+         * @returns {string}          The matched option text or undefined if not found
+         */
+        getComboOptionText: function (options, value) {
+            var matchedOption = options.find(function (option) {
+                return option.value === value;
+            });
+            return nfCommon.isDefinedAndNotNull(matchedOption) ? matchedOption.text : undefined;
+        },
+
+        /**
+         * Creates a throttled function that invokes at most once every wait milliseconds.
+         *
+         * @param func                The function to throttle.
+         * @param wait                The number of milliseconds to throttle invocations to.
+         * @returns {function}        The throttled version of the function.
+         */
+        throttle: function (func, wait) {
+            return _.throttle(func, wait);
         }
+
     };
 
     return nfCommon;

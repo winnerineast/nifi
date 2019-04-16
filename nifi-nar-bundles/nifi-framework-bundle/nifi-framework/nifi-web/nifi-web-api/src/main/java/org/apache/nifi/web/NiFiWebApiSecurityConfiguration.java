@@ -20,6 +20,8 @@ import org.apache.nifi.util.NiFiProperties;
 import org.apache.nifi.web.security.anonymous.NiFiAnonymousUserFilter;
 import org.apache.nifi.web.security.jwt.JwtAuthenticationFilter;
 import org.apache.nifi.web.security.jwt.JwtAuthenticationProvider;
+import org.apache.nifi.web.security.knox.KnoxAuthenticationFilter;
+import org.apache.nifi.web.security.knox.KnoxAuthenticationProvider;
 import org.apache.nifi.web.security.otp.OtpAuthenticationFilter;
 import org.apache.nifi.web.security.otp.OtpAuthenticationProvider;
 import org.apache.nifi.web.security.x509.X509AuthenticationFilter;
@@ -41,6 +43,11 @@ import org.springframework.security.config.annotation.web.configuration.WebSecur
 import org.springframework.security.config.http.SessionCreationPolicy;
 import org.springframework.security.web.authentication.AnonymousAuthenticationFilter;
 import org.springframework.security.web.authentication.preauth.x509.X509PrincipalExtractor;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.CorsConfigurationSource;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+
+import java.util.Arrays;
 
 /**
  * NiFi Web Api Spring security
@@ -65,6 +72,9 @@ public class NiFiWebApiSecurityConfiguration extends WebSecurityConfigurerAdapte
     private OtpAuthenticationFilter otpAuthenticationFilter;
     private OtpAuthenticationProvider otpAuthenticationProvider;
 
+    private KnoxAuthenticationFilter knoxAuthenticationFilter;
+    private KnoxAuthenticationProvider knoxAuthenticationProvider;
+
     private NiFiAnonymousUserFilter anonymousAuthenticationFilter;
 
     public NiFiWebApiSecurityConfiguration() {
@@ -78,12 +88,13 @@ public class NiFiWebApiSecurityConfiguration extends WebSecurityConfigurerAdapte
         // the /access/download-token and /access/ui-extension-token endpoints
         webSecurity
                 .ignoring()
-                    .antMatchers("/access", "/access/config", "/access/token", "/access/kerberos");
+                    .antMatchers("/access", "/access/config", "/access/token", "/access/kerberos", "/access/oidc/**", "/access/knox/**");
     }
 
     @Override
     protected void configure(HttpSecurity http) throws Exception {
         http
+                .cors().and()
                 .rememberMe().disable()
                 .authorizeRequests()
                     .anyRequest().fullyAuthenticated()
@@ -100,8 +111,21 @@ public class NiFiWebApiSecurityConfiguration extends WebSecurityConfigurerAdapte
         // otp
         http.addFilterBefore(otpFilterBean(), AnonymousAuthenticationFilter.class);
 
+        // knox
+        http.addFilterBefore(knoxFilterBean(), AnonymousAuthenticationFilter.class);
+
         // anonymous
         http.anonymous().authenticationFilter(anonymousFilterBean());
+    }
+
+
+    @Bean
+    CorsConfigurationSource corsConfigurationSource() {
+        CorsConfiguration configuration = new CorsConfiguration();
+        configuration.setAllowedMethods(Arrays.asList("HEAD", "GET"));
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/process-groups/*/templates/upload", configuration);
+        return source;
     }
 
     @Bean
@@ -116,7 +140,8 @@ public class NiFiWebApiSecurityConfiguration extends WebSecurityConfigurerAdapte
         auth
                 .authenticationProvider(x509AuthenticationProvider)
                 .authenticationProvider(jwtAuthenticationProvider)
-                .authenticationProvider(otpAuthenticationProvider);
+                .authenticationProvider(otpAuthenticationProvider)
+                .authenticationProvider(knoxAuthenticationProvider);
     }
 
     @Bean
@@ -137,6 +162,16 @@ public class NiFiWebApiSecurityConfiguration extends WebSecurityConfigurerAdapte
             otpAuthenticationFilter.setAuthenticationManager(authenticationManager());
         }
         return otpAuthenticationFilter;
+    }
+
+    @Bean
+    public KnoxAuthenticationFilter knoxFilterBean() throws Exception {
+        if (knoxAuthenticationFilter == null) {
+            knoxAuthenticationFilter = new KnoxAuthenticationFilter();
+            knoxAuthenticationFilter.setProperties(properties);
+            knoxAuthenticationFilter.setAuthenticationManager(authenticationManager());
+        }
+        return knoxAuthenticationFilter;
     }
 
     @Bean
@@ -172,6 +207,11 @@ public class NiFiWebApiSecurityConfiguration extends WebSecurityConfigurerAdapte
     @Autowired
     public void setOtpAuthenticationProvider(OtpAuthenticationProvider otpAuthenticationProvider) {
         this.otpAuthenticationProvider = otpAuthenticationProvider;
+    }
+
+    @Autowired
+    public void setKnoxAuthenticationProvider(KnoxAuthenticationProvider knoxAuthenticationProvider) {
+        this.knoxAuthenticationProvider = knoxAuthenticationProvider;
     }
 
     @Autowired

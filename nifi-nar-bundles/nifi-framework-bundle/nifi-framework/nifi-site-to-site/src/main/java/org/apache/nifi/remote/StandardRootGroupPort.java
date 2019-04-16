@@ -110,17 +110,18 @@ public class StandardRootGroupPort extends AbstractPort implements RootGroupPort
         this.identityMappings = IdentityMappingUtil.getIdentityMappings(nifiProperties);
         this.bulletinRepository = bulletinRepository;
         this.scheduler = scheduler;
-        setYieldPeriod("100 millis");
+        setYieldPeriod(nifiProperties.getBoredYieldDuration());
         eventReporter = new EventReporter() {
             private static final long serialVersionUID = 1L;
 
             @Override
             public void reportEvent(final Severity severity, final String category, final String message) {
                 final String groupId = StandardRootGroupPort.this.getProcessGroup().getIdentifier();
+                final String groupName = StandardRootGroupPort.this.getProcessGroup().getName();
                 final String sourceId = StandardRootGroupPort.this.getIdentifier();
                 final String sourceName = StandardRootGroupPort.this.getName();
                 final ComponentType componentType = direction == TransferDirection.RECEIVE ? ComponentType.INPUT_PORT : ComponentType.OUTPUT_PORT;
-                bulletinRepository.addBulletin(BulletinFactory.createBulletin(groupId, sourceId, componentType, sourceName, category, severity.name(), message));
+                bulletinRepository.addBulletin(BulletinFactory.createBulletin(groupId, groupName, sourceId, componentType, sourceName, category, severity.name(), message));
             }
         };
 
@@ -141,12 +142,13 @@ public class StandardRootGroupPort extends AbstractPort implements RootGroupPort
     public void onTrigger(final ProcessContext context, final ProcessSessionFactory sessionFactory) {
         final FlowFileRequest flowFileRequest;
         try {
-            flowFileRequest = requestQueue.poll(100, TimeUnit.MILLISECONDS);
+            flowFileRequest = requestQueue.poll(1, TimeUnit.MILLISECONDS);
         } catch (final InterruptedException ie) {
             return;
         }
 
         if (flowFileRequest == null) {
+            context.yield();
             return;
         }
 
@@ -518,6 +520,8 @@ public class StandardRootGroupPort extends AbstractPort implements RootGroupPort
             // before the request expires
             while (!request.isBeingServiced()) {
                 if (request.isExpired()) {
+                    // Remove expired request, so that it won't block new request to be offered.
+                    this.requestQueue.remove(request);
                     throw new SocketTimeoutException("Read timed out");
                 } else {
                     try {
@@ -572,6 +576,8 @@ public class StandardRootGroupPort extends AbstractPort implements RootGroupPort
             // before the request expires
             while (!request.isBeingServiced()) {
                 if (request.isExpired()) {
+                    // Remove expired request, so that it won't block new request to be offered.
+                    this.requestQueue.remove(request);
                     throw new SocketTimeoutException("Read timed out");
                 } else {
                     try {
