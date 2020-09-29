@@ -24,6 +24,7 @@ import io.swagger.annotations.ApiResponses;
 import io.swagger.annotations.Authorization;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.authorization.AuthorizeControllerServiceReference;
+import org.apache.nifi.authorization.AuthorizeParameterReference;
 import org.apache.nifi.authorization.Authorizer;
 import org.apache.nifi.authorization.ComponentAuthorizable;
 import org.apache.nifi.authorization.RequestAction;
@@ -46,6 +47,8 @@ import org.apache.nifi.web.api.entity.ComponentStateEntity;
 import org.apache.nifi.web.api.entity.ProcessorDiagnosticsEntity;
 import org.apache.nifi.web.api.entity.ProcessorEntity;
 import org.apache.nifi.web.api.entity.ProcessorRunStatusEntity;
+import org.apache.nifi.web.api.entity.ProcessorsRunStatusDetailsEntity;
+import org.apache.nifi.web.api.entity.RunStatusDetailsRequestEntity;
 import org.apache.nifi.web.api.entity.PropertyDescriptorEntity;
 import org.apache.nifi.web.api.request.ClientIdParameter;
 import org.apache.nifi.web.api.request.LongParameter;
@@ -210,6 +213,50 @@ public class ProcessorResource extends ApplicationResource {
         // generate the response
         return generateOkResponse(entity).build();
     }
+
+
+    @POST
+    @Consumes(MediaType.APPLICATION_JSON)
+    @Produces(MediaType.APPLICATION_JSON)
+    @Path("/run-status-details/queries")
+    @ApiOperation(
+        value = "Submits a query to retrieve the run status details of all processors that are in the given list of Processor IDs",
+        response = ProcessorsRunStatusDetailsEntity.class,
+        authorizations = {
+            @Authorization(value = "Read - /processors/{uuid} for each processor whose run status information is requested")
+        }
+    )
+    @ApiResponses(
+        value = {
+            @ApiResponse(code = 400, message = "NiFi was unable to complete the request because it was invalid. The request should not be retried without modification."),
+            @ApiResponse(code = 401, message = "Client could not be authenticated."),
+            @ApiResponse(code = 403, message = "Client is not authorized to make this request."),
+            @ApiResponse(code = 404, message = "The specified resource could not be found."),
+            @ApiResponse(code = 409, message = "The request was valid but NiFi was not in the appropriate state to process it. Retrying the same request later may be successful.")
+        }
+    )
+    public Response getProcessorRunStatusDetails(
+        @ApiParam(value = "The request for the processors that should be included in the results")
+        final RunStatusDetailsRequestEntity requestEntity) {
+
+        if (requestEntity.getProcessorIds() == null) {
+            throw new IllegalArgumentException("List of Processor IDs must be provided");
+        }
+
+        if (isReplicateRequest()) {
+            return replicate(HttpMethod.POST, requestEntity);
+        }
+
+        return withWriteLock(serviceFacade,
+            requestEntity,
+            lookup -> {},
+            null,
+            providedEntity -> {
+                final ProcessorsRunStatusDetailsEntity entity = serviceFacade.getProcessorsRunStatusDetails(requestEntity.getProcessorIds(), NiFiUserUtils.getNiFiUser());
+                return generateOkResponse(entity).build();
+            });
+    }
+
 
     @DELETE
     @Consumes(MediaType.WILDCARD)
@@ -518,7 +565,7 @@ public class ProcessorResource extends ApplicationResource {
             @ApiParam(
                     value = "The processor configuration details.",
                     required = true
-            ) final ProcessorEntity requestProcessorEntity) throws InterruptedException {
+            ) final ProcessorEntity requestProcessorEntity) {
 
         if (requestProcessorEntity == null || requestProcessorEntity.getComponent() == null) {
             throw new IllegalArgumentException("Processor details must be specified.");
@@ -563,6 +610,7 @@ public class ProcessorResource extends ApplicationResource {
                     final ProcessorConfigDTO config = requestProcessorDTO.getConfig();
                     if (config != null) {
                         AuthorizeControllerServiceReference.authorizeControllerServiceReferences(config.getProperties(), authorizable, authorizer, lookup);
+                        AuthorizeParameterReference.authorizeParameterReferences(config.getProperties(), authorizer, authorizable.getParameterContext(), user);
                     }
                 },
                 () -> serviceFacade.verifyUpdateProcessor(requestProcessorDTO),

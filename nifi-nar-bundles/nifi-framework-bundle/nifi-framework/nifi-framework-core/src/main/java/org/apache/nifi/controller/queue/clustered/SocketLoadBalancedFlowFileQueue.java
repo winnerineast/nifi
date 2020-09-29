@@ -114,7 +114,7 @@ public class SocketLoadBalancedFlowFileQueue extends AbstractFlowFileQueue imple
     private final Lock partitionReadLock = partitionLock.readLock();
     private final Lock partitionWriteLock = partitionLock.writeLock();
     private QueuePartition[] queuePartitions;
-    private FlowFilePartitioner partitioner;
+    private volatile FlowFilePartitioner partitioner;
     private boolean stopped = true;
     private volatile boolean offloaded = false;
 
@@ -144,19 +144,29 @@ public class SocketLoadBalancedFlowFileQueue extends AbstractFlowFileQueue imple
         sortedNodeIdentifiers.sort(Comparator.comparing(NodeIdentifier::getApiAddress));
 
         if (sortedNodeIdentifiers.isEmpty()) {
+            // No Node Identifiers are known yet. Just create the partitions using the local partition.
             queuePartitions = new QueuePartition[] { localPartition };
         } else {
-            queuePartitions = new QueuePartition[sortedNodeIdentifiers.size()];
+            // The node identifiers are known. Create the partitions using the local partition and 1 Remote Partition for each node
+            // that is not the local node identifier. If the Local Node Identifier is not yet known, that's okay. When it becomes known,
+            // the queuePartitions array will be recreated with the appropriate partitions.
+            final List<QueuePartition> partitionList = new ArrayList<>();
 
-            for (int i = 0; i < sortedNodeIdentifiers.size(); i++) {
-                final NodeIdentifier nodeId = sortedNodeIdentifiers.get(i);
-                if (nodeId.equals(clusterCoordinator.getLocalNodeIdentifier())) {
-                    queuePartitions[i] = localPartition;
+            final NodeIdentifier localNodeId = clusterCoordinator.getLocalNodeIdentifier();
+            for (final NodeIdentifier nodeId : sortedNodeIdentifiers) {
+                if (nodeId.equals(localNodeId)) {
+                    partitionList.add(localPartition);
                 } else {
-                    queuePartitions[i] = createRemotePartition(nodeId);
+                    partitionList.add(createRemotePartition(nodeId));
                 }
             }
 
+            // Ensure that our list of queue partitions always contains the local partition.
+            if (!partitionList.contains(localPartition)) {
+                partitionList.add(localPartition);
+            }
+
+            queuePartitions = partitionList.toArray(new QueuePartition[0]);
         }
 
         partitioner = new LocalPartitionPartitioner();
@@ -337,51 +347,32 @@ public class SocketLoadBalancedFlowFileQueue extends AbstractFlowFileQueue imple
                     return;
                 }
 
-                partitionReadLock.lock();
-                try {
-                    if (isRebalanceOnFailure(partitionerUsed)) {
-                        logger.debug("Transferring {} FlowFiles to Rebalancing Partition from node {}", flowFiles.size(), nodeId);
-                        rebalancingPartition.rebalance(flowFiles);
-                    } else {
-                        logger.debug("Returning {} FlowFiles to their queue for node {} because Partitioner {} indicates that the FlowFiles should stay where they are", flowFiles.size(), nodeId,
-                            partitioner);
-                        partitionQueue.putAll(flowFiles);
-                    }
-                } finally {
-                    partitionReadLock.unlock();
+                if (isRebalanceOnFailure(partitionerUsed)) {
+                    logger.debug("Transferring {} FlowFiles to Rebalancing Partition from node {}", flowFiles.size(), nodeId);
+                    rebalancingPartition.rebalance(flowFiles);
+                } else {
+                    logger.debug("Returning {} FlowFiles to their queue for node {} because Partitioner {} indicates that the FlowFiles should stay where they are",
+                        flowFiles.size(), nodeId, partitionerUsed);
+                    partitionQueue.putAll(flowFiles);
                 }
             }
 
             @Override
             public void putAll(final Function<String, FlowFileQueueContents> queueContentsFunction, final FlowFilePartitioner partitionerUsed) {
-                partitionReadLock.lock();
-                try {
-                    if (isRebalanceOnFailure(partitionerUsed)) {
-                        final FlowFileQueueContents contents = queueContentsFunction.apply(rebalancingPartition.getSwapPartitionName());
-                        rebalancingPartition.rebalance(contents);
-                        logger.debug("Transferring all {} FlowFiles and {} Swap Files queued for node {} to Rebalancing Partition",
-                            contents.getActiveFlowFiles().size(), contents.getSwapLocations().size(), nodeId);
-                    } else {
-                        logger.debug("Will not transfer FlowFiles queued for node {} to Rebalancing Partition because Partitioner {} indicates that the FlowFiles should stay where they are", nodeId,
-                            partitioner);
-                    }
-                } finally {
-                    partitionReadLock.unlock();
+                if (isRebalanceOnFailure(partitionerUsed)) {
+                    final FlowFileQueueContents contents = queueContentsFunction.apply(rebalancingPartition.getSwapPartitionName());
+                    rebalancingPartition.rebalance(contents);
+                    logger.debug("Transferring all {} FlowFiles and {} Swap Files queued for node {} to Rebalancing Partition",
+                        contents.getActiveFlowFiles().size(), contents.getSwapLocations().size(), nodeId);
+                } else {
+                    logger.debug("Will not transfer FlowFiles queued for node {} to Rebalancing Partition because Partitioner {} indicates that the FlowFiles should stay where they are",
+                        nodeId, partitionerUsed);
                 }
             }
 
             @Override
             public boolean isRebalanceOnFailure(final FlowFilePartitioner partitionerUsed) {
-                partitionReadLock.lock();
-                try {
-                    if (!partitionerUsed.equals(partitioner)) {
-                        return true;
-                    }
-
-                    return partitioner.isRebalanceOnFailure();
-                } finally {
-                    partitionReadLock.unlock();
-                }
+                return partitionerUsed.isRebalanceOnFailure() || !partitionerUsed.equals(partitioner);
             }
         };
 
@@ -743,6 +734,7 @@ public class SocketLoadBalancedFlowFileQueue extends AbstractFlowFileQueue imple
     public void put(final FlowFileRecord flowFile) {
         putAndGetPartition(flowFile);
     }
+
 
     protected QueuePartition putAndGetPartition(final FlowFileRecord flowFile) {
         final QueuePartition partition;
@@ -1159,6 +1151,11 @@ public class SocketLoadBalancedFlowFileQueue extends AbstractFlowFileQueue imple
                 partitionWriteLock.unlock();
             }
         }
+    }
+
+    @Override
+    public String toString() {
+        return "FlowFileQueue[id=" + getIdentifier() + ", Load Balance Strategy=" + getLoadBalanceStrategy() + ", size=" + size() + "]";
     }
 }
 

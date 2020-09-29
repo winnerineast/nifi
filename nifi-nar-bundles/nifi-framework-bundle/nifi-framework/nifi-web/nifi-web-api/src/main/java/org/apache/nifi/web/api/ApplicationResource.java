@@ -16,12 +16,45 @@
  */
 package org.apache.nifi.web.api;
 
+import static javax.ws.rs.core.Response.Status.NOT_FOUND;
+import static org.apache.commons.lang3.StringUtils.isEmpty;
+import static org.apache.nifi.remote.protocol.http.HttpHeaders.LOCATION_URI_INTENT_NAME;
+import static org.apache.nifi.remote.protocol.http.HttpHeaders.LOCATION_URI_INTENT_VALUE;
+
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BiFunction;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
+import javax.ws.rs.core.CacheControl;
+import javax.ws.rs.core.Context;
+import javax.ws.rs.core.MediaType;
+import javax.ws.rs.core.MultivaluedHashMap;
+import javax.ws.rs.core.MultivaluedMap;
+import javax.ws.rs.core.Response;
+import javax.ws.rs.core.Response.ResponseBuilder;
+import javax.ws.rs.core.UriBuilder;
+import javax.ws.rs.core.UriBuilderException;
+import javax.ws.rs.core.UriInfo;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.authorization.AuthorizableLookup;
 import org.apache.nifi.authorization.AuthorizeAccess;
 import org.apache.nifi.authorization.AuthorizeControllerServiceReference;
+import org.apache.nifi.authorization.AuthorizeParameterReference;
 import org.apache.nifi.authorization.Authorizer;
 import org.apache.nifi.authorization.ComponentAuthorizable;
 import org.apache.nifi.authorization.ProcessGroupAuthorizable;
@@ -58,39 +91,6 @@ import org.apache.nifi.web.security.util.CacheKey;
 import org.apache.nifi.web.util.WebUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
-import javax.ws.rs.core.CacheControl;
-import javax.ws.rs.core.Context;
-import javax.ws.rs.core.MediaType;
-import javax.ws.rs.core.MultivaluedHashMap;
-import javax.ws.rs.core.MultivaluedMap;
-import javax.ws.rs.core.Response;
-import javax.ws.rs.core.Response.ResponseBuilder;
-import javax.ws.rs.core.UriBuilder;
-import javax.ws.rs.core.UriBuilderException;
-import javax.ws.rs.core.UriInfo;
-import java.net.URI;
-import java.net.URISyntaxException;
-import java.nio.charset.StandardCharsets;
-import java.util.Collections;
-import java.util.Enumeration;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
-import java.util.TreeMap;
-import java.util.UUID;
-import java.util.concurrent.TimeUnit;
-import java.util.function.BiFunction;
-import java.util.function.Consumer;
-import java.util.function.Function;
-
-import static javax.ws.rs.core.Response.Status.NOT_FOUND;
-import static org.apache.commons.lang3.StringUtils.isEmpty;
-import static org.apache.nifi.remote.protocol.http.HttpHeaders.LOCATION_URI_INTENT_NAME;
-import static org.apache.nifi.remote.protocol.http.HttpHeaders.LOCATION_URI_INTENT_VALUE;
 
 /**
  * Base class for controllers.
@@ -161,8 +161,8 @@ public abstract class ApplicationResource {
             final String port = determineProxiedPort(hostHeaderValue, portHeaderValue);
 
             // Catch header poisoning
-            String whitelistedContextPaths = properties.getWhitelistedContextPaths();
-            String resourcePath = WebUtils.getResourcePath(uri, httpServletRequest, whitelistedContextPaths);
+            String allowedContextPaths = properties.getAllowedContextPaths();
+            String resourcePath = WebUtils.getResourcePath(uri, httpServletRequest, allowedContextPaths);
 
             // determine the port uri
             int uriPort = uri.getPort();
@@ -511,19 +511,23 @@ public abstract class ApplicationResource {
     /**
      * Authorizes the specified process group.
      *
-     * @param processGroupAuthorizable    process group
-     * @param authorizer                  authorizer
-     * @param lookup                      lookup
-     * @param action                      action
-     * @param authorizeReferencedServices whether to authorize referenced services
-     * @param authorizeTemplates          whether to authorize templates
-     * @param authorizeControllerServices whether to authorize controller services
+     * @param processGroupAuthorizable     process group
+     * @param authorizer                   authorizer
+     * @param lookup                       lookup
+     * @param action                       action
+     * @param authorizeReferencedServices  whether to authorize referenced services
+     * @param authorizeTemplates           whether to authorize templates
+     * @param authorizeControllerServices  whether to authorize controller services
+     * @param authorizeTransitiveServices  whether to authorize transitive services
+     * @param authorizeParameterReferences whether to authorize parameter references
      */
     protected void authorizeProcessGroup(final ProcessGroupAuthorizable processGroupAuthorizable, final Authorizer authorizer, final AuthorizableLookup lookup, final RequestAction action,
                                          final boolean authorizeReferencedServices, final boolean authorizeTemplates,
-                                         final boolean authorizeControllerServices, final boolean authorizeTransitiveServices) {
+                                         final boolean authorizeControllerServices, final boolean authorizeTransitiveServices,
+                                         final boolean authorizeParameterReferences) {
 
-        final Consumer<Authorizable> authorize = authorizable -> authorizable.authorize(authorizer, action, NiFiUserUtils.getNiFiUser());
+        final NiFiUser user = NiFiUserUtils.getNiFiUser();
+        final Consumer<Authorizable> authorize = authorizable -> authorizable.authorize(authorizer, action, user);
 
         // authorize the process group
         authorize.accept(processGroupAuthorizable.getAuthorizable());
@@ -536,6 +540,11 @@ public abstract class ApplicationResource {
             // authorize any referenced services if necessary
             if (authorizeReferencedServices) {
                 AuthorizeControllerServiceReference.authorizeControllerServiceReferences(processorAuthorizable, authorizer, lookup, authorizeTransitiveServices);
+            }
+
+            // authorize any referenced parameters if necessary
+            if (authorizeParameterReferences) {
+                AuthorizeParameterReference.authorizeParameterReferences(processorAuthorizable, authorizer, processorAuthorizable.getParameterContext(), user);
             }
         });
         processGroupAuthorizable.getEncapsulatedConnections().stream().map(connection -> connection.getAuthorizable()).forEach(authorize);
@@ -561,6 +570,10 @@ public abstract class ApplicationResource {
                 if (authorizeReferencedServices) {
                     AuthorizeControllerServiceReference.authorizeControllerServiceReferences(controllerServiceAuthorizable, authorizer, lookup, authorizeTransitiveServices);
                 }
+
+                if (authorizeParameterReferences) {
+                    AuthorizeParameterReference.authorizeParameterReferences(controllerServiceAuthorizable, authorizer, controllerServiceAuthorizable.getParameterContext(), user);
+                }
             });
         }
     }
@@ -573,18 +586,20 @@ public abstract class ApplicationResource {
      * @param action     action
      */
     protected void authorizeSnippet(final SnippetAuthorizable snippet, final Authorizer authorizer, final AuthorizableLookup lookup, final RequestAction action,
-                                    final boolean authorizeReferencedServices, final boolean authorizeTransitiveServices) {
+                                    final boolean authorizeReferencedServices, final boolean authorizeTransitiveServices, final boolean authorizeParameterReferences) {
 
-        final Consumer<Authorizable> authorize = authorizable -> authorizable.authorize(authorizer, action, NiFiUserUtils.getNiFiUser());
+        final NiFiUser user = NiFiUserUtils.getNiFiUser();
+        final Consumer<Authorizable> authorize = authorizable -> authorizable.authorize(authorizer, action, user);
 
         // authorize each component in the specified snippet
-        snippet.getSelectedProcessGroups().stream().forEach(processGroupAuthorizable -> {
+        snippet.getSelectedProcessGroups().forEach(processGroupAuthorizable -> {
             // note - we are not authorizing templates or controller services as they are not considered when using this snippet. however,
             // referenced services are considered so those are explicitly authorized when authorizing a processor
-            authorizeProcessGroup(processGroupAuthorizable, authorizer, lookup, action, authorizeReferencedServices, false, false, authorizeTransitiveServices);
+            authorizeProcessGroup(processGroupAuthorizable, authorizer, lookup, action, authorizeReferencedServices,
+                    false, false, authorizeTransitiveServices, authorizeParameterReferences);
         });
-        snippet.getSelectedRemoteProcessGroups().stream().forEach(authorize);
-        snippet.getSelectedProcessors().stream().forEach(processorAuthorizable -> {
+        snippet.getSelectedRemoteProcessGroups().forEach(authorize);
+        snippet.getSelectedProcessors().forEach(processorAuthorizable -> {
             // authorize the processor
             authorize.accept(processorAuthorizable.getAuthorizable());
 
@@ -592,12 +607,17 @@ public abstract class ApplicationResource {
             if (authorizeReferencedServices) {
                 AuthorizeControllerServiceReference.authorizeControllerServiceReferences(processorAuthorizable, authorizer, lookup, authorizeTransitiveServices);
             }
+
+            // authorize any parameter usage
+            if (authorizeParameterReferences) {
+                AuthorizeParameterReference.authorizeParameterReferences(processorAuthorizable, authorizer, processorAuthorizable.getParameterContext(), user);
+            }
         });
-        snippet.getSelectedInputPorts().stream().forEach(authorize);
-        snippet.getSelectedOutputPorts().stream().forEach(authorize);
-        snippet.getSelectedConnections().stream().forEach(connAuth -> authorize.accept(connAuth.getAuthorizable()));
-        snippet.getSelectedFunnels().stream().forEach(authorize);
-        snippet.getSelectedLabels().stream().forEach(authorize);
+        snippet.getSelectedInputPorts().forEach(authorize);
+        snippet.getSelectedOutputPorts().forEach(authorize);
+        snippet.getSelectedConnections().forEach(connAuth -> authorize.accept(connAuth.getAuthorizable()));
+        snippet.getSelectedFunnels().forEach(authorize);
+        snippet.getSelectedLabels().forEach(authorize);
     }
 
     /**
@@ -881,7 +901,7 @@ public abstract class ApplicationResource {
 
     private void ensureFlowInitialized() {
         if (!flowController.isInitialized()) {
-            throw new IllegalClusterStateException("Cluster is still in the process of voting on the appropriate Data Flow.");
+            throw new IllegalClusterStateException("The Flow Controller is initializing the Data Flow.");
         }
     }
 

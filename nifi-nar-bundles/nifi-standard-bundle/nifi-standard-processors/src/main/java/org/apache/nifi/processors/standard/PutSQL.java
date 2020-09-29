@@ -76,6 +76,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BiFunction;
+import java.util.stream.Collectors;
 
 import static java.lang.String.format;
 import static org.apache.nifi.processor.util.pattern.ExceptionHandler.createOnError;
@@ -151,7 +152,10 @@ public class PutSQL extends AbstractSessionFactoryProcessor {
             .description("If true, when a FlowFile is consumed by this Processor, the Processor will first check the fragment.identifier and fragment.count attributes of that FlowFile. "
                     + "If the fragment.count value is greater than 1, the Processor will not process any FlowFile with that fragment.identifier until all are available; "
                     + "at that point, it will process all FlowFiles with that fragment.identifier as a single transaction, in the order specified by the FlowFiles' fragment.index attributes. "
-                    + "This Provides atomicity of those SQL statements. If this value is false, these attributes will be ignored and the updates will occur independent of one another.")
+                    + "This Provides atomicity of those SQL statements. Once any statement of this transaction throws exception when executing, this transaction will be rolled back. When "
+                    + "transaction rollback happened, none of these FlowFiles would be routed to 'success'. If the <Rollback On Failure> is set true, these FlowFiles will stay in the input "
+                    + "relationship. When the <Rollback On Failure> is set false,, if any of these FlowFiles will be routed to 'retry', all of these FlowFiles will be routed to 'retry'.Otherwise, "
+                    + "they will be routed to 'failure'. If this value is false, these attributes will be ignored and the updates will occur independent of one another.")
             .allowableValues("true", "false")
             .defaultValue("true")
             .build();
@@ -275,9 +279,9 @@ public class PutSQL extends AbstractSessionFactoryProcessor {
         return poll.getFlowFiles();
     };
 
-    private final PartialFunctions.InitConnection<FunctionContext, Connection> initConnection = (c, s, fc, ff) -> {
+    private final PartialFunctions.InitConnection<FunctionContext, Connection> initConnection = (c, s, fc, ffs) -> {
         final Connection connection = c.getProperty(CONNECTION_POOL).asControllerService(DBCPService.class)
-                .getConnection(ff == null ? Collections.emptyMap() : ff.getAttributes());
+                .getConnection(ffs == null || ffs.isEmpty() ? Collections.emptyMap() : ffs.get(0).getAttributes());
         try {
             fc.originalAutoCommit = connection.getAutoCommit();
             final boolean autocommit = c.getProperty(AUTO_COMMIT).asBoolean();
@@ -578,6 +582,20 @@ public class PutSQL extends AbstractSessionFactoryProcessor {
             }
         });
 
+        process.adjustFailed((c, r) -> {
+            if (c.getProperty(SUPPORT_TRANSACTIONS).asBoolean()){
+                if (r.contains(REL_RETRY) || r.contains(REL_FAILURE)) {
+                    final List<FlowFile> transferredFlowFiles = r.getRoutedFlowFiles().values().stream()
+                            .flatMap(List::stream).collect(Collectors.toList());
+                    Relationship rerouteShip = r.contains(REL_RETRY) ? REL_RETRY : REL_FAILURE;
+                    r.getRoutedFlowFiles().clear();
+                    r.routeTo(transferredFlowFiles, rerouteShip);
+                    return true;
+                }
+            }
+            return false;
+        });
+
         exceptionHandler = new ExceptionHandler<>();
         exceptionHandler.mapException(e -> {
             if (e instanceof SQLNonTransientException) {
@@ -621,13 +639,18 @@ public class PutSQL extends AbstractSessionFactoryProcessor {
         boolean fragmentedTransaction = false;
 
         final int batchSize = context.getProperty(BATCH_SIZE).asInteger();
+        final FlowFileFilter dbcpServiceFlowFileFilter = context.getProperty(CONNECTION_POOL).asControllerService(DBCPService.class).getFlowFileFilter(batchSize);
         List<FlowFile> flowFiles;
         if (useTransactions) {
-            final TransactionalFlowFileFilter filter = new TransactionalFlowFileFilter();
+            final TransactionalFlowFileFilter filter = new TransactionalFlowFileFilter(dbcpServiceFlowFileFilter);
             flowFiles = session.get(filter);
             fragmentedTransaction = filter.isFragmentedTransaction();
         } else {
-            flowFiles = session.get(batchSize);
+            if (dbcpServiceFlowFileFilter == null) {
+                flowFiles = session.get(batchSize);
+            } else {
+                flowFiles = session.get(dbcpServiceFlowFileFilter);
+            }
         }
 
         if (flowFiles.isEmpty()) {
@@ -804,12 +827,26 @@ public class PutSQL extends AbstractSessionFactoryProcessor {
      * across multiple FlowFiles) or that none of the FlowFiles belongs to a fragmented transaction
      */
     static class TransactionalFlowFileFilter implements FlowFileFilter {
+        private final FlowFileFilter nonFragmentedTransactionFilter;
         private String selectedId = null;
         private int numSelected = 0;
         private boolean ignoreFragmentIdentifiers = false;
 
+        public TransactionalFlowFileFilter(FlowFileFilter nonFragmentedTransactionFilter) {
+            this.nonFragmentedTransactionFilter = nonFragmentedTransactionFilter;
+        }
+
         public boolean isFragmentedTransaction() {
             return !ignoreFragmentIdentifiers;
+        }
+
+        private FlowFileFilterResult filterNonFragmentedTransaction(final FlowFile flowFile) {
+            if (nonFragmentedTransactionFilter == null) {
+                return FlowFileFilterResult.ACCEPT_AND_CONTINUE;
+            } else {
+                // Use non-fragmented tx filter for further filtering.
+                return nonFragmentedTransactionFilter.filter(flowFile);
+            }
         }
 
         @Override
@@ -821,7 +858,7 @@ public class PutSQL extends AbstractSessionFactoryProcessor {
             // we accept any FlowFile that is also not part of a fragmented transaction.
             if (ignoreFragmentIdentifiers) {
                 if (fragmentId == null || "1".equals(fragCount)) {
-                    return FlowFileFilterResult.ACCEPT_AND_CONTINUE;
+                    return filterNonFragmentedTransaction(flowFile);
                 } else {
                     return FlowFileFilterResult.REJECT_AND_CONTINUE;
                 }
@@ -831,7 +868,7 @@ public class PutSQL extends AbstractSessionFactoryProcessor {
                 if (selectedId == null) {
                     // Only one FlowFile in the transaction.
                     ignoreFragmentIdentifiers = true;
-                    return FlowFileFilterResult.ACCEPT_AND_CONTINUE;
+                    return filterNonFragmentedTransaction(flowFile);
                 } else {
                     // we've already selected 1 FlowFile, and this one doesn't match.
                     return FlowFileFilterResult.REJECT_AND_CONTINUE;

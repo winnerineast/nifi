@@ -65,6 +65,8 @@
     var CONNECTION_OFFSET_Y_INCREMENT = 75;
     var CONNECTION_OFFSET_X_INCREMENT = 200;
 
+    var connectionUpsertionInProgress = false;
+
     var config = {
         urls: {
             api: '../nifi-api',
@@ -123,15 +125,12 @@
                                 text: '#ffffff'
                             },
                             disabled: function () {
-                                // ensure some relationships were selected
-                                return getSelectedRelationships().length === 0;
+                                // ensure some relationships were selected, also check create or updation in progress
+                                return getSelectedRelationships().length === 0 || isConnectionUpsertionInProgess();
                             },
                             handler: {
                                 click: function () {
                                     addConnection(getSelectedRelationships());
-
-                                    // close the dialog
-                                    $('#connection-configuration').modal('hide');
                                 }
                             }
                         },
@@ -141,6 +140,10 @@
                                     base: '#E3E8EB',
                                     hover: '#C7D2D7',
                                     text: '#004849'
+                                },
+                                disabled: function() {
+                                    // when add button is clicked, should disable until the addition action is completed
+                                    return isConnectionUpsertionInProgess();
                                 },
                                 handler: {
                                     click: function () {
@@ -191,13 +194,14 @@
                             hover: '#004849',
                             text: '#ffffff'
                         },
+                        disabled : function(){
+                            // when network is slow, should disable the button
+                            return isConnectionUpsertionInProgess();
+                        },
                         handler: {
                             click: function () {
                                 // add the connection
                                 addConnection();
-
-                                // close the dialog
-                                $('#connection-configuration').modal('hide');
                             }
                         }
                     },
@@ -207,6 +211,9 @@
                                 base: '#E3E8EB',
                                 hover: '#C7D2D7',
                                 text: '#004849'
+                            },
+                            disabled : function(){
+                                return isConnectionUpsertionInProgess();
                             },
                             handler: {
                                 click: function () {
@@ -330,7 +337,12 @@
 
                 // show the output port options
                 var options = [];
+                var publicOutputPortCount = 0;
                 $.each(processGroupContents.outputPorts, function (i, outputPort) {
+                    if (outputPort.allowRemoteAccess) {
+                        publicOutputPortCount++;
+                        return;
+                    }
                     // require explicit access to the output port as it's the source of the connection
                     if (outputPort.permissions.canRead && outputPort.permissions.canWrite) {
                         var component = outputPort.component;
@@ -369,9 +381,10 @@
 
                     deferred.resolve();
                 } else {
-                    var message = '\'' + nfCommon.escapeHtml(processGroupName) + '\' does not have any output ports.';
-                    if (nfCommon.isEmpty(processGroupContents.outputPorts) === false) {
-                        message = 'Not authorized for any output ports in \'' + nfCommon.escapeHtml(processGroupName) + '\'.';
+                    var message = '\'' + nfCommon.escapeHtml(processGroupName) + '\' does not have any local output ports.';
+                    if (nfCommon.isEmpty(processGroupContents.outputPorts) === false
+                            && processGroupContents.outputPorts.length > publicOutputPortCount) {
+                        message = 'Not authorized for any local output ports in \'' + nfCommon.escapeHtml(processGroupName) + '\'.';
                     }
 
                     // there are no output ports for this process group
@@ -445,6 +458,8 @@
                     $('#connection-source-component-id').val(remoteProcessGroup.id);
 
                     // populate the group details
+                    $('#connection-source-group div.setting-name').text('Within Remote Group')
+                    $('#connection-remote-source-url').text(remoteProcessGroup.targetUri).show();
                     $('#connection-source-group-id').val(remoteProcessGroup.id);
                     $('#connection-source-group-name').text(remoteProcessGroup.name);
 
@@ -565,11 +580,13 @@
                 // show the input port options
                 var options = [];
                 $.each(processGroupContents.inputPorts, function (i, inputPort) {
-                    options.push({
-                        text: inputPort.permissions.canRead ? inputPort.component.name : inputPort.id,
-                        value: inputPort.id,
-                        description: inputPort.permissions.canRead ? nfCommon.escapeHtml(inputPort.component.comments) : null
-                    });
+                    if (!inputPort.allowRemoteAccess) {
+                        options.push({
+                            text: inputPort.permissions.canRead ? inputPort.component.name : inputPort.id,
+                            value: inputPort.id,
+                            description: inputPort.permissions.canRead ? nfCommon.escapeHtml(inputPort.component.comments) : null
+                        });
+                    }
                 });
 
                 // only proceed if there are output ports
@@ -602,7 +619,7 @@
                     // there are no relationships for this processor
                     nfDialog.showOkDialog({
                         headerText: 'Connection Configuration',
-                        dialogContent: '\'' + nfCommon.escapeHtml(processGroupName) + '\' does not have any input ports.'
+                        dialogContent: '\'' + nfCommon.escapeHtml(processGroupName) + '\' does not have any local input ports.'
                     });
 
                     // reset the dialog
@@ -670,6 +687,8 @@
                     $('#connection-destination-component-id').val(remoteProcessGroup.id);
 
                     // populate the group details
+                    $('#connection-destination-group div.setting-name').text('Within Remote Group')
+                    $('#connection-remote-destination-url').text(remoteProcessGroup.targetUri).show();
                     $('#connection-destination-group-id').val(remoteProcessGroup.id);
                     $('#connection-destination-group-name').text(remoteProcessGroup.name);
 
@@ -714,6 +733,13 @@
             // populate the group details
             $('#connection-source-group-id').val(sourceData.id);
             $('#connection-source-group-name').text(sourceName);
+
+            if (nfCanvasUtils.isRemoteProcessGroup(source)) {
+                $('#connection-source-group div.setting-name').text('Within Remote Group');
+                if (sourceData.permissions.canRead) {
+                    $('#connection-remote-source-url').text(sourceData.component.targetUri).show();
+                }
+            }
 
             // resolve the deferred
             deferred.resolve();
@@ -770,11 +796,36 @@
     };
 
     /**
+     * To set or reset the connection addition/update in progress
+     * @param {boolean} status the status of connection addition/update
+     */
+    var setConnectionUpsertionInProgess = function(status)
+    {        
+        var needToUpdateDOM = (connectionUpsertionInProgress !== status) ;
+        connectionUpsertionInProgress = status;
+        if(needToUpdateDOM){
+            $('#connection-configuration').modal('refreshButtons');
+        }
+    }
+
+    /**
+     * returns whether the connection addition/update in progress
+     */
+    var isConnectionUpsertionInProgess = function()
+    {        
+        return connectionUpsertionInProgress;
+    }
+
+    /**
      * Adds a new connection.
      *
      * @argument {array} selectedRelationships      The selected relationships
      */
     var addConnection = function (selectedRelationships) {
+        // to handle the case of slow network
+        //the add/cancel buttons should be disabled
+        setConnectionUpsertionInProgess(true);
+
         // get the connection details
         var sourceId = $('#connection-source-id').val();
         var destinationId = $('#connection-destination-id').val();
@@ -971,6 +1022,11 @@
                     'selectAll': true
                 });
 
+                setConnectionUpsertionInProgess(false);
+
+                // close the dialog
+                $('#connection-configuration').modal('hide');
+
                 // reload the connections source/destination components
                 nfCanvasUtils.reloadConnectionSourceAndDestination(sourceComponentId, destinationComponentId);
 
@@ -979,9 +1035,11 @@
 
                 // update the birdseye
                 nfBirdseye.refresh();
-            }).fail(function (xhr, status, error) {
-                // handle the error
-                nfErrorHandler.handleAjaxError(xhr, status, error);
+            }).fail(function(xhr, status, error){
+
+                // update the button status 
+                setConnectionUpsertionInProgess(false);
+                nfErrorHandler.handleConfigurationUpdateAjaxError(xhr, status, error);
             });
         }
     };
@@ -992,6 +1050,9 @@
      * @argument {array} selectedRelationships          The selected relationships
      */
     var updateConnection = function (selectedRelationships) {
+        //apply, cancel buttons should be disabled, while the connection update is in progress
+        setConnectionUpsertionInProgess(true);
+
         // get the connection details
         var connectionId = $('#connection-id').text();
         var connectionUri = $('#connection-uri').val();
@@ -1051,20 +1112,20 @@
                 dataType: 'json',
                 contentType: 'application/json'
             }).done(function (response) {
+                //update updation progress status
+                setConnectionUpsertionInProgess(false);
+
+                // close the dialog
+                $('#connection-configuration').modal('hide');
+
                 // update this connection
                 nfConnection.set(response);
 
                 // reload the connections source/destination components
                 nfCanvasUtils.reloadConnectionSourceAndDestination(sourceComponentId, destinationComponentId);
-            }).fail(function (xhr, status, error) {
-                if (xhr.status === 400 || xhr.status === 404 || xhr.status === 409) {
-                    nfDialog.showOkDialog({
-                        headerText: 'Connection Configuration',
-                        dialogContent: nfCommon.escapeHtml(xhr.responseText),
-                    });
-                } else {
-                    nfErrorHandler.handleAjaxError(xhr, status, error);
-                }
+            }).fail(function(xhr, status, error){
+                setConnectionUpsertionInProgess(false);
+                nfErrorHandler.handleConfigurationUpdateAjaxError(xhr, status, error);
             });
         } else {
             return $.Deferred(function (deferred) {
@@ -1120,7 +1181,7 @@
 
         if (errors.length > 0) {
             nfDialog.showOkDialog({
-                headerText: 'Connection Configuration',
+                headerText: 'Configuration Error',
                 dialogContent: nfCommon.formatUnorderedList(errors)
             });
             return false;
@@ -1331,6 +1392,12 @@
                 return;
             }
 
+            // reset labels
+            $('#connection-source-group div.setting-name').text('Within Group')
+            $('#connection-destination-group div.setting-name').text('Within Group')
+            $('#connection-remote-source-url').hide();
+            $('#connection-remote-destination-url').hide();
+
             // initialize the connection dialog
             $.when(initializeSourceNewConnectionDialog(source), initializeDestinationNewConnectionDialog(destination)).done(function () {
                 // set the default values
@@ -1382,6 +1449,12 @@
                     var destinationComponentId = nfCanvasUtils.getConnectionDestinationComponentId(connectionEntry);
                     destination = d3.select('#id-' + destinationComponentId);
                 }
+
+                // reset labels
+                $('#connection-source-group div.setting-name').text('Within Group')
+                $('#connection-destination-group div.setting-name').text('Within Group')
+                $('#connection-remote-source-url').hide();
+                $('#connection-remote-destination-url').hide();
 
                 // initialize the connection dialog
                 $.when(initializeSourceEditConnectionDialog(source), initializeDestinationEditConnectionDialog(destination, connection.destination)).done(function () {
@@ -1473,12 +1546,13 @@
                         disabled: function () {
                             // ensure some relationships were selected with a processor as the source
                             if (nfCanvasUtils.isProcessor(source)) {
-                                return getSelectedRelationships().length === 0;
+                                return getSelectedRelationships().length === 0 || isConnectionUpsertionInProgess();
                             }
-                            return false;
+                            return isConnectionUpsertionInProgess();
                         },
                         handler: {
                             click: function () {
+                                setConnectionUpsertionInProgess(true);
                                 // see if we're working with a processor as the source
                                 if (nfCanvasUtils.isProcessor(source)) {
                                     // update the selected relationships
@@ -1486,6 +1560,8 @@
                                         deferred.resolve();
                                     }).fail(function () {
                                         deferred.reject();
+                                    }).always(function(){
+                                        setConnectionUpsertionInProgess(false);
                                     });
                                 } else {
                                     // there are no relationships, but the source wasn't a processor, so update anyway
@@ -1493,11 +1569,10 @@
                                         deferred.resolve();
                                     }).fail(function () {
                                         deferred.reject();
+                                    }).always(function(){
+                                        setConnectionUpsertionInProgess(false);
                                     });
                                 }
-
-                                // close the dialog
-                                $('#connection-configuration').modal('hide');
                             }
                         }
                     },
@@ -1507,6 +1582,9 @@
                                 base: '#E3E8EB',
                                 hover: '#C7D2D7',
                                 text: '#004849'
+                            },
+                            disabled: function(){
+                                return isConnectionUpsertionInProgess();
                             },
                             handler: {
                                 click: function () {

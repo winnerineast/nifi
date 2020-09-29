@@ -43,9 +43,9 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
 import static org.junit.Assert.fail;
-import static org.mockito.Matchers.any;
-import static org.mockito.Matchers.anyLong;
-import static org.mockito.Matchers.anyString;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -243,6 +243,78 @@ public class PutCassandraQLTest {
                         put("cql.args.9.value", "0xDEADBEEF");
                         put("cql.args.10.type", "timestamp");
                         put("cql.args.10.value", "not a timestamp");
+
+                    }
+                });
+
+        testRunner.run(1, true, true);
+        testRunner.assertAllFlowFilesTransferred(PutCassandraQL.REL_FAILURE, 1);
+        testRunner.clearTransferState();
+    }
+
+    @Test
+    public void testProcessorUuid() {
+        setUpStandardTestConfig();
+
+        testRunner.enqueue("INSERT INTO users (user_id, first_name, last_name, properties, bits, scaleset, largenum, scale, byteobject, ts) VALUES ?, ?, ?, ?, ?, ?, ?, ?, ?, ?",
+                new HashMap<String, String>() {
+                    {
+                        put("cql.args.1.type", "int");
+                        put("cql.args.1.value", "1");
+                        put("cql.args.2.type", "text");
+                        put("cql.args.2.value", "Joe");
+                        put("cql.args.3.type", "text");
+                        // No value for arg 3 to test setNull
+                        put("cql.args.4.type", "map<text,text>");
+                        put("cql.args.4.value", "{'a':'Hello', 'b':'World'}");
+                        put("cql.args.5.type", "list<boolean>");
+                        put("cql.args.5.value", "[true,false,true]");
+                        put("cql.args.6.type", "set<double>");
+                        put("cql.args.6.value", "{1.0, 2.0}");
+                        put("cql.args.7.type", "bigint");
+                        put("cql.args.7.value", "20000000");
+                        put("cql.args.8.type", "float");
+                        put("cql.args.8.value", "1.0");
+                        put("cql.args.9.type", "blob");
+                        put("cql.args.9.value", "0xDEADBEEF");
+                        put("cql.args.10.type", "uuid");
+                        put("cql.args.10.value", "5442b1f6-4c16-11ea-87f5-45a32dbc5199");
+
+                    }
+                });
+
+        testRunner.run(1, true, true);
+        testRunner.assertAllFlowFilesTransferred(PutCassandraQL.REL_SUCCESS, 1);
+        testRunner.clearTransferState();
+    }
+
+    @Test
+    public void testProcessorBadUuid() {
+        setUpStandardTestConfig();
+
+        testRunner.enqueue("INSERT INTO users (user_id, first_name, last_name, properties, bits, scaleset, largenum, scale, byteobject, ts) VALUES ?, ?, ?, ?, ?, ?, ?, ?, ?, ?",
+                new HashMap<String, String>() {
+                    {
+                        put("cql.args.1.type", "int");
+                        put("cql.args.1.value", "1");
+                        put("cql.args.2.type", "text");
+                        put("cql.args.2.value", "Joe");
+                        put("cql.args.3.type", "text");
+                        // No value for arg 3 to test setNull
+                        put("cql.args.4.type", "map<text,text>");
+                        put("cql.args.4.value", "{'a':'Hello', 'b':'World'}");
+                        put("cql.args.5.type", "list<boolean>");
+                        put("cql.args.5.value", "[true,false,true]");
+                        put("cql.args.6.type", "set<double>");
+                        put("cql.args.6.value", "{1.0, 2.0}");
+                        put("cql.args.7.type", "bigint");
+                        put("cql.args.7.value", "20000000");
+                        put("cql.args.8.type", "float");
+                        put("cql.args.8.value", "1.0");
+                        put("cql.args.9.type", "blob");
+                        put("cql.args.9.value", "0xDEADBEEF");
+                        put("cql.args.10.type", "uuid");
+                        put("cql.args.10.value", "bad-uuid");
 
                     }
                 });

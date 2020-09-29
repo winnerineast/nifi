@@ -41,6 +41,7 @@ import org.apache.nifi.annotation.behavior.Stateful;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
+import org.apache.nifi.annotation.lifecycle.OnAdded;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.annotation.lifecycle.OnStopped;
 import org.apache.nifi.components.PropertyDescriptor;
@@ -68,7 +69,9 @@ import org.apache.nifi.script.impl.FilteredPropertiesValidationContextAdapter;
 @CapabilityDescription("Experimental - Invokes a script engine for a Processor defined in the given script. The script must define "
         + "a valid class that implements the Processor interface, and it must set a variable 'processor' to an instance of "
         + "the class. Processor methods such as onTrigger() will be delegated to the scripted Processor instance. Also any "
-        + "Relationships or PropertyDescriptors defined by the scripted processor will be added to the configuration dialog.  "
+        + "Relationships or PropertyDescriptors defined by the scripted processor will be added to the configuration dialog. The scripted processor can "
+        + "implement public void setLogger(ComponentLog logger) to get access to the parent logger, as well as public void onScheduled(ProcessContext context) and "
+        + "public void onStopped(ProcessContext context) methods to be invoked when the parent InvokeScriptedProcessor is scheduled or stopped, respectively.  "
         + "Experimental: Impact of sustained usage not yet verified.")
 @DynamicProperty(name = "A script engine property to update", value = "The value to set it to",
         expressionLanguageScope = ExpressionLanguageScope.FLOWFILE_ATTRIBUTES,
@@ -205,6 +208,8 @@ public class InvokeScriptedProcessor extends AbstractSessionFactoryProcessor {
     public void setup(final ProcessContext context) {
         scriptingComponentHelper.setupVariables(context);
         setup();
+
+        invokeScriptedProcessorMethod("onScheduled", context);
     }
 
     public void setup() {
@@ -563,10 +568,45 @@ public class InvokeScriptedProcessor extends AbstractSessionFactoryProcessor {
         }
     }
 
+    @OnAdded
+    public void added() {
+        // Create the resources whether or not they have been created already, this method is guaranteed to have the instance classloader set
+        // as the thread context class loader. Other methods that call createResources() may be called from other threads with different
+        // classloaders
+        scriptingComponentHelper.createResources();
+    }
+
     @OnStopped
-    public void stop() {
+    public void stop(ProcessContext context) {
+        invokeScriptedProcessorMethod("onStopped", context);
         scriptingComponentHelper.stop();
         processor.set(null);
         scriptEngine = null;
+    }
+
+    private void invokeScriptedProcessorMethod(String methodName, Object... params) {
+        // Run the scripted processor's method here, if it exists
+        if (scriptEngine instanceof Invocable) {
+            final Invocable invocable = (Invocable) scriptEngine;
+            final Object obj = scriptEngine.get("processor");
+            if (obj != null) {
+
+                ComponentLog logger = getLogger();
+                try {
+                    invocable.invokeMethod(obj, methodName, params);
+                } catch (final NoSuchMethodException nsme) {
+                    if (logger.isDebugEnabled()) {
+                        logger.debug("Configured script Processor does not contain the method " + methodName);
+                    }
+                } catch (final Exception e) {
+                    // An error occurred during onScheduled, propagate it up
+                    logger.error("Error while executing the scripted processor's method " + methodName, e);
+                    if (e instanceof ProcessException) {
+                        throw (ProcessException) e;
+                    }
+                    throw new ProcessException(e);
+                }
+            }
+        }
     }
 }

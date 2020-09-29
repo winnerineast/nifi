@@ -18,7 +18,6 @@ package org.apache.nifi.remote;
 
 import static java.util.Objects.requireNonNull;
 
-import java.io.File;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
@@ -54,6 +53,7 @@ import org.apache.nifi.authorization.resource.Authorizable;
 import org.apache.nifi.authorization.resource.ResourceFactory;
 import org.apache.nifi.authorization.resource.ResourceType;
 import org.apache.nifi.components.ValidationResult;
+import org.apache.nifi.components.state.StateManager;
 import org.apache.nifi.connectable.ConnectableType;
 import org.apache.nifi.connectable.Connection;
 import org.apache.nifi.connectable.Port;
@@ -100,6 +100,7 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
     private final ProcessScheduler scheduler;
     private final EventReporter eventReporter;
     private final NiFiProperties nifiProperties;
+    private final StateManager stateManager;
     private final long remoteContentsCacheExpiration;
     private volatile boolean initialized = false;
 
@@ -146,8 +147,10 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
     private final ScheduledExecutorService backgroundThreadExecutor;
 
     public StandardRemoteProcessGroup(final String id, final String targetUris, final ProcessGroup processGroup, final ProcessScheduler processScheduler,
-                                      final BulletinRepository bulletinRepository, final SSLContext sslContext, final NiFiProperties nifiProperties) {
+                                      final BulletinRepository bulletinRepository, final SSLContext sslContext, final NiFiProperties nifiProperties,
+                                      final StateManager stateManager) {
         this.nifiProperties = nifiProperties;
+        this.stateManager = stateManager;
         this.id = requireNonNull(id);
 
         this.targetUris = targetUris;
@@ -234,11 +237,6 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
     @Override
     public void onRemove() {
         backgroundThreadExecutor.shutdown();
-
-        final File file = getPeerPersistenceFile();
-        if (file.exists() && !file.delete()) {
-            logger.warn("Failed to remove {}. This file should be removed manually.", file);
-        }
     }
 
     @Override
@@ -465,6 +463,8 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
     public void setInputPorts(final Set<RemoteProcessGroupPortDescriptor> ports, final boolean pruneUnusedPorts) {
         writeLock.lock();
         try {
+            logger.debug("Updating Input Ports for {}", this);
+
             final List<String> newPortTargetIds = new ArrayList<>();
             for (final RemoteProcessGroupPortDescriptor descriptor : ports) {
                 newPortTargetIds.add(descriptor.getTargetId());
@@ -485,8 +485,11 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
                     sendPort = inputPortByName.get(descriptor.getName());
                     if (sendPort == null) {
                         sendPort = addInputPort(descriptor);
+                        logger.info("Added Input Port {} with Name {} and Target Identifier {} to {}", sendPort.getIdentifier(), sendPort.getName(), sendPort.getTargetIdentifier(), this);
                     } else {
+                        final String previousTargetId = sendPort.getTargetIdentifier();
                         sendPort.setTargetIdentifier(descriptor.getTargetId());
+                        logger.info("Updated Target identifier for Input Port with Name {} from {} to {} for {}", descriptor.getName(), previousTargetId, descriptor.getTargetId(), this);
                     }
                 }
 
@@ -503,6 +506,8 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
             // a ConcurrentModificationException.
             if (pruneUnusedPorts) {
                 final Iterator<StandardRemoteGroupPort> itr = inputPorts.values().iterator();
+
+                int prunedCount = 0;
                 while (itr.hasNext()) {
                     final StandardRemoteGroupPort port = itr.next();
                     if (!newPortTargetIds.contains(port.getTargetIdentifier())) {
@@ -512,9 +517,19 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
                         // If port has incoming connection, it will be cleaned up when the connection is removed
                         if (!port.hasIncomingConnection()) {
                             itr.remove();
+                            logger.debug("Pruning unused Input Port {} from {}", port, this);
+                            prunedCount++;
                         }
                     }
                 }
+
+                if (prunedCount == 0) {
+                    logger.debug("There were no Input Ports to prune from {}", this);
+                } else {
+                    logger.debug("Successfully pruned {} unused Input Ports from {}", prunedCount, this);
+                }
+            } else {
+                logger.debug("Updated Input Ports for {} but did not attempt to prune any unused ports", this);
             }
         } finally {
             writeLock.unlock();
@@ -574,8 +589,11 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
                     receivePort = outputPortByName.get(descriptor.getName());
                     if (receivePort == null) {
                         receivePort = addOutputPort(descriptor);
+                        logger.info("Added Output Port {} with Name {} and Target Identifier {} to {}", receivePort.getIdentifier(), receivePort.getName(), receivePort.getTargetIdentifier(), this);
                     } else {
+                        final String previousTargetId = receivePort.getTargetIdentifier();
                         receivePort.setTargetIdentifier(descriptor.getTargetId());
+                        logger.info("Updated Target identifier for Output Port with Name {} from {} to {} for {}", descriptor.getName(), previousTargetId, descriptor.getTargetId(), this);
                     }
                 }
 
@@ -592,6 +610,8 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
             // a ConcurrentModificationException.
             if (pruneUnusedPorts) {
                 final Iterator<StandardRemoteGroupPort> itr = outputPorts.values().iterator();
+
+                int prunedCount = 0;
                 while (itr.hasNext()) {
                     final StandardRemoteGroupPort port = itr.next();
                     if (!newPortTargetIds.contains(port.getTargetIdentifier())) {
@@ -601,10 +621,20 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
                         // If port has connections, it will be cleaned up when connections are removed
                         if (port.getConnections().isEmpty()) {
                             itr.remove();
+                            logger.info("Pruning unused Output Port {} from {}", port, this);
                         }
                     }
                 }
+
+                if (prunedCount == 0) {
+                    logger.debug("There were no Output Ports to prune from {}", this);
+                } else {
+                    logger.debug("Successfully pruned {} unused Output Ports from {}", prunedCount, this);
+                }
+            } else {
+                logger.debug("Updated Output Ports for {} but did not attempt to prune any unused ports", this);
             }
+
         } finally {
             writeLock.unlock();
         }
@@ -660,8 +690,9 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
                 throw new IllegalStateException("Output Port with ID " + descriptor.getId() + " already exists");
             }
 
-            final StandardRemoteGroupPort port = new StandardRemoteGroupPort(descriptor.getId(), descriptor.getTargetId(), descriptor.getName(), getProcessGroup(),
+            final StandardRemoteGroupPort port = new StandardRemoteGroupPort(descriptor.getId(), descriptor.getTargetId(), descriptor.getName(),
                     this, TransferDirection.RECEIVE, ConnectableType.REMOTE_OUTPUT_PORT, sslContext, scheduler, nifiProperties);
+            port.setProcessGroup(getProcessGroup());
             outputPorts.put(descriptor.getId(), port);
 
             if (descriptor.getConcurrentlySchedulableTaskCount() != null) {
@@ -741,8 +772,9 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
             // all nodes in a cluster to use the same UUID. However, we want the ID to be
             // unique for each Remote Group Port, so that if we have multiple RPG's pointing
             // to the same target, we have unique ID's for each of those ports.
-            final StandardRemoteGroupPort port = new StandardRemoteGroupPort(descriptor.getId(), descriptor.getTargetId(), descriptor.getName(), getProcessGroup(), this,
+            final StandardRemoteGroupPort port = new StandardRemoteGroupPort(descriptor.getId(), descriptor.getTargetId(), descriptor.getName(), this,
                     TransferDirection.SEND, ConnectableType.REMOTE_INPUT_PORT, sslContext, scheduler, nifiProperties);
+            port.setProcessGroup(getProcessGroup());
 
             if (descriptor.getConcurrentlySchedulableTaskCount() != null) {
                 port.setMaxConcurrentTasks(descriptor.getConcurrentlySchedulableTaskCount());
@@ -882,6 +914,16 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
                 final RemoteProcessGroupCounts newCounts = new RemoteProcessGroupCounts(inputPortCount, outputPortCount);
                 setCounts(newCounts);
                 this.refreshContentsTimestamp = System.currentTimeMillis();
+
+                final List<String> inputPortString = dto.getInputPorts().stream()
+                    .map(port -> "InputPort[name=" + port.getName() + ", targetId=" + port.getId() + "]")
+                    .collect(Collectors.toList());
+                final List<String> outputPortString = dto.getOutputPorts().stream()
+                    .map(port -> "OutputPort[name=" + port.getName() + ", targetId=" + port.getId() + "]")
+                    .collect(Collectors.toList());
+
+                logger.info("Successfully refreshed Flow Contents for {}; updated to reflect {} Input Ports {} and {} Output Ports {}", this, dto.getInputPorts().size(), inputPortString,
+                    dto.getOutputPorts().size(), outputPortString);
             } finally {
                 writeLock.unlock();
             }
@@ -1364,11 +1406,6 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
         }
     }
 
-    private File getPeerPersistenceFile() {
-        final File stateDir = nifiProperties.getPersistentStateDirectory();
-        return new File(stateDir, getIdentifier() + ".peers");
-    }
-
     @Override
     public Optional<String> getVersionedComponentId() {
         return Optional.ofNullable(versionedComponentId.get());
@@ -1390,5 +1427,10 @@ public class StandardRemoteProcessGroup implements RemoteProcessGroup {
                 throw new IllegalStateException(this + " is already under version control");
             }
         }
+    }
+
+    @Override
+    public StateManager getStateManager() {
+        return stateManager;
     }
 }

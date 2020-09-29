@@ -25,8 +25,11 @@ import org.apache.nifi.controller.ScheduledState;
 import org.apache.nifi.controller.flow.FlowManager;
 import org.apache.nifi.controller.service.ControllerServiceNode;
 import org.apache.nifi.controller.service.ControllerServiceState;
+import org.apache.nifi.groups.FlowFileConcurrency;
+import org.apache.nifi.groups.FlowFileOutboundPolicy;
 import org.apache.nifi.groups.ProcessGroup;
 import org.apache.nifi.groups.RemoteProcessGroup;
+import org.apache.nifi.parameter.ParameterContext;
 import org.apache.nifi.registry.flow.FlowRegistry;
 import org.apache.nifi.registry.flow.StandardVersionControlInformation;
 import org.apache.nifi.registry.flow.VersionControlInformation;
@@ -38,6 +41,7 @@ import org.apache.nifi.web.ResourceNotFoundException;
 import org.apache.nifi.web.api.dto.ProcessGroupDTO;
 import org.apache.nifi.web.api.dto.VariableRegistryDTO;
 import org.apache.nifi.web.api.dto.VersionControlInformationDTO;
+import org.apache.nifi.web.api.entity.ParameterContextReferenceEntity;
 import org.apache.nifi.web.api.entity.VariableEntity;
 import org.apache.nifi.web.dao.ProcessGroupDAO;
 
@@ -76,6 +80,12 @@ public class StandardProcessGroupDAO extends ComponentDAO implements ProcessGrou
             group.setPosition(new Position(processGroup.getPosition().getX(), processGroup.getPosition().getY()));
         }
 
+        final ParameterContextReferenceEntity parameterContextReference = processGroup.getParameterContext();
+        if (parameterContextReference != null && parameterContextReference.getId() != null) {
+            final ParameterContext parameterContext = flowController.getFlowManager().getParameterContextManager().getParameterContext(parameterContextReference.getId());
+            group.setParameterContext(parameterContext);
+        }
+
         // add the process group
         group.setParent(parentGroup);
         parentGroup.addProcessGroup(group);
@@ -90,6 +100,28 @@ public class StandardProcessGroupDAO extends ComponentDAO implements ProcessGrou
 
     @Override
     public void verifyUpdate(final ProcessGroupDTO processGroup) {
+        final ParameterContextReferenceEntity parameterContextReference = processGroup.getParameterContext();
+        if (parameterContextReference == null) {
+            return;
+        }
+
+        final ParameterContext parameterContext = locateParameterContext(parameterContextReference.getId());
+        final ProcessGroup group = locateProcessGroup(flowController, processGroup.getId());
+        group.verifyCanSetParameterContext(parameterContext);
+    }
+
+    private ParameterContext locateParameterContext(final String id) {
+        final ParameterContext parameterContext;
+        if (id == null) {
+            return null;
+        } else {
+            parameterContext = flowController.getFlowManager().getParameterContextManager().getParameterContext(id);
+            if (parameterContext == null) {
+                throw new IllegalStateException("Cannot update Process Group's Parameter Context because no Parameter Context exists with ID " + id);
+            }
+
+            return parameterContext;
+        }
     }
 
     @Override
@@ -305,6 +337,26 @@ public class StandardProcessGroupDAO extends ComponentDAO implements ProcessGrou
 
         final String name = processGroupDTO.getName();
         final String comments = processGroupDTO.getComments();
+        final String concurrencyName = processGroupDTO.getFlowfileConcurrency();
+        final FlowFileConcurrency flowFileConcurrency = concurrencyName == null ? null : FlowFileConcurrency.valueOf(concurrencyName);
+
+        final String outboundPolicyName = processGroupDTO.getFlowfileOutboundPolicy();
+        final FlowFileOutboundPolicy flowFileOutboundPolicy = outboundPolicyName == null ? null : FlowFileOutboundPolicy.valueOf(outboundPolicyName);
+
+        final ParameterContextReferenceEntity parameterContextReference = processGroupDTO.getParameterContext();
+        if (parameterContextReference != null) {
+            final String parameterContextId = parameterContextReference.getId();
+            if (parameterContextId == null) {
+                group.setParameterContext(null);
+            } else {
+                final ParameterContext parameterContext = flowController.getFlowManager().getParameterContextManager().getParameterContext(parameterContextId);
+                if (parameterContext == null) {
+                    throw new IllegalStateException("Cannot set Process Group's Parameter Context because no Parameter Context exists with ID " + parameterContextId);
+                }
+
+                group.setParameterContext(parameterContext);
+            }
+        }
 
         if (isNotNull(name)) {
             group.setName(name);
@@ -319,7 +371,12 @@ public class StandardProcessGroupDAO extends ComponentDAO implements ProcessGrou
         if (isNotNull(comments)) {
             group.setComments(comments);
         }
-
+        if (flowFileConcurrency != null) {
+            group.setFlowFileConcurrency(flowFileConcurrency);
+        }
+        if (flowFileOutboundPolicy != null) {
+            group.setFlowFileOutboundPolicy(flowFileOutboundPolicy);
+        }
         group.onComponentModified();
         return group;
     }
@@ -363,11 +420,14 @@ public class StandardProcessGroupDAO extends ComponentDAO implements ProcessGrou
         group.updateFlow(proposedSnapshot, componentIdSeed, verifyNotModified, updateSettings, updateDescendantVersionedFlows);
         group.findAllRemoteProcessGroups().forEach(RemoteProcessGroup::initialize);
 
-        final StandardVersionControlInformation svci = StandardVersionControlInformation.Builder.fromDto(versionControlInformation)
-            .flowSnapshot(proposedSnapshot.getFlowContents())
-            .build();
+        // process group being updated may not be versioned
+        if (versionControlInformation != null) {
+            final StandardVersionControlInformation svci = StandardVersionControlInformation.Builder.fromDto(versionControlInformation)
+                    .flowSnapshot(proposedSnapshot.getFlowContents())
+                    .build();
+            group.setVersionControlInformation(svci, Collections.emptyMap());
+        }
 
-        group.setVersionControlInformation(svci, Collections.emptyMap());
         group.onComponentModified();
 
         return group;

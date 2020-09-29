@@ -91,6 +91,7 @@ org.apache.nifi.processors.standard.PutEmail
 org.apache.nifi.processors.standard.PutFile
 org.apache.nifi.processors.standard.PutFTP
 org.apache.nifi.processors.standard.PutJMS
+org.apache.nifi.processors.standard.PutRecord
 org.apache.nifi.processors.standard.PutSFTP
 org.apache.nifi.processors.standard.PutSQL
 org.apache.nifi.processors.standard.PutSyslog
@@ -101,6 +102,7 @@ org.apache.nifi.processors.standard.QueryDatabaseTableRecord
 org.apache.nifi.processors.standard.QueryRecord
 org.apache.nifi.processors.standard.ReplaceText
 org.apache.nifi.processors.standard.ReplaceTextWithMapping
+org.apache.nifi.processors.standard.RetryFlowFile
 org.apache.nifi.processors.standard.RouteOnAttribute
 org.apache.nifi.processors.standard.RouteOnContent
 org.apache.nifi.processors.standard.RouteText

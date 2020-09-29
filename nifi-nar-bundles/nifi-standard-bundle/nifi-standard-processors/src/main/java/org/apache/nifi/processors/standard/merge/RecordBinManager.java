@@ -146,7 +146,8 @@ public class RecordBinManager {
         }
 
         // if we've reached this point then we couldn't fit it into any existing bins - gotta make a new one
-        final RecordBin bin = new RecordBin(context, sessionFactory.createSession(), logger, createThresholds());
+
+        final RecordBin bin = new RecordBin(context, sessionFactory.createSession(), logger, createThresholds(flowFile));
         final boolean binAccepted = bin.offer(flowFile, reader, session, true);
         if (!binAccepted) {
             session.rollback();
@@ -179,9 +180,9 @@ public class RecordBinManager {
     }
 
 
-    private RecordBinThresholds createThresholds() {
-        final int minRecords = context.getProperty(MergeRecord.MIN_RECORDS).asInteger();
-        final int maxRecords = context.getProperty(MergeRecord.MAX_RECORDS).asInteger();
+    private RecordBinThresholds createThresholds(FlowFile flowfile) {
+        int minRecords = context.getProperty(MergeRecord.MIN_RECORDS).evaluateAttributeExpressions().asInteger();
+        final int maxRecords = context.getProperty(MergeRecord.MAX_RECORDS).evaluateAttributeExpressions().asInteger();
         final long minBytes = context.getProperty(MergeRecord.MIN_SIZE).asDataSize(DataUnit.B).longValue();
 
         final PropertyValue maxSizeValue = context.getProperty(MergeRecord.MAX_SIZE);
@@ -195,6 +196,8 @@ public class RecordBinManager {
         final String mergeStrategy = context.getProperty(MergeRecord.MERGE_STRATEGY).getValue();
         if (MergeRecord.MERGE_STRATEGY_DEFRAGMENT.getValue().equals(mergeStrategy)) {
             fragmentCountAttribute = MergeContent.FRAGMENT_COUNT_ATTRIBUTE;
+            // We don't know minRecords in defragment mode.
+            minRecords = Integer.MAX_VALUE;
         } else {
             fragmentCountAttribute = null;
         }
@@ -235,15 +238,15 @@ public class RecordBinManager {
 
     public int completeExpiredBins() throws IOException {
         final long maxNanos = maxBinAgeNanos.get();
-        return handleCompletedBins(bin -> bin.isOlderThan(maxNanos, TimeUnit.NANOSECONDS));
+        return handleCompletedBins(bin -> bin.isOlderThan(maxNanos, TimeUnit.NANOSECONDS), "Bin has reached Max Bin Age");
     }
 
     public int completeFullEnoughBins() throws IOException {
-        return handleCompletedBins(RecordBin::isFullEnough);
+        return handleCompletedBins(RecordBin::isFullEnough, "Bin is full enough");
     }
 
-    private int handleCompletedBins(final Predicate<RecordBin> completionTest) throws IOException {
-        final Map<String, List<RecordBin>> expiredBinMap = new HashMap<>();
+    private int handleCompletedBins(final Predicate<RecordBin> completionTest, final String completionReason) throws IOException {
+        final Map<String, List<RecordBin>> completedBinMap = new HashMap<>();
 
         lock.lock();
         try {
@@ -253,7 +256,7 @@ public class RecordBinManager {
 
                 for (final RecordBin bin : bins) {
                     if (completionTest.test(bin)) {
-                        final List<RecordBin> expiredBinsForKey = expiredBinMap.computeIfAbsent(key, ignore -> new ArrayList<>());
+                        final List<RecordBin> expiredBinsForKey = completedBinMap.computeIfAbsent(key, ignore -> new ArrayList<>());
                         expiredBinsForKey.add(bin);
                     }
                 }
@@ -263,17 +266,17 @@ public class RecordBinManager {
         }
 
         int completed = 0;
-        for (final Map.Entry<String, List<RecordBin>> entry : expiredBinMap.entrySet()) {
+        for (final Map.Entry<String, List<RecordBin>> entry : completedBinMap.entrySet()) {
             final String key = entry.getKey();
-            final List<RecordBin> expiredBins = entry.getValue();
+            final List<RecordBin> completeBins = entry.getValue();
 
-            for (final RecordBin bin : expiredBins) {
-                logger.debug("Completing Bin {} because it has expired");
-                bin.complete("Bin has reached Max Bin Age");
+            for (final RecordBin bin : completeBins) {
+                logger.debug("Completing Bin {} because {}", new Object[]{bin, completionReason});
+                bin.complete(completionReason);
                 completed++;
             }
 
-            removeBins(key, expiredBins);
+            removeBins(key, completeBins);
         }
 
         return completed;

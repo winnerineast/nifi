@@ -20,6 +20,7 @@ import com.amazonaws.AmazonWebServiceClient;
 import com.amazonaws.ClientConfiguration;
 import com.amazonaws.Protocol;
 import com.amazonaws.auth.AWSCredentials;
+import com.amazonaws.auth.AWSCredentialsProvider;
 import com.amazonaws.auth.AnonymousAWSCredentials;
 import com.amazonaws.auth.BasicAWSCredentials;
 import com.amazonaws.auth.PropertiesCredentials;
@@ -57,6 +58,7 @@ import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.processors.aws.credentials.provider.factory.CredentialPropertyDescriptors;
 import org.apache.nifi.proxy.ProxyConfiguration;
 import org.apache.nifi.proxy.ProxySpec;
+import org.apache.nifi.security.util.SslContextFactory;
 import org.apache.nifi.ssl.SSLContextService;
 
 /**
@@ -157,11 +159,11 @@ public abstract class AbstractAWSProcessor<ClientType extends AmazonWebServiceCl
     private static final ProxySpec[] PROXY_SPECS = {ProxySpec.HTTP_AUTH};
     public static final PropertyDescriptor PROXY_CONFIGURATION_SERVICE = ProxyConfiguration.createProxyConfigPropertyDescriptor(true, PROXY_SPECS);
 
-    protected static AllowableValue createAllowableValue(final Regions region) {
+    public static AllowableValue createAllowableValue(final Regions region) {
         return new AllowableValue(region.getName(), region.getDescription(), "AWS Region Code : " + region.getName());
     }
 
-    protected static AllowableValue[] getAvailableRegions() {
+    public static AllowableValue[] getAvailableRegions() {
         final List<AllowableValue> values = new ArrayList<>();
         for (final Regions region : Regions.values()) {
             values.add(createAllowableValue(region));
@@ -225,7 +227,7 @@ public abstract class AbstractAWSProcessor<ClientType extends AmazonWebServiceCl
         if(this.getSupportedPropertyDescriptors().contains(SSL_CONTEXT_SERVICE)) {
             final SSLContextService sslContextService = context.getProperty(SSL_CONTEXT_SERVICE).asControllerService(SSLContextService.class);
             if (sslContextService != null) {
-                final SSLContext sslContext = sslContextService.createSSLContext(SSLContextService.ClientAuth.NONE);
+                final SSLContext sslContext = sslContextService.createSSLContext(SslContextFactory.ClientAuth.NONE);
                 // NIFI-3788: Changed hostnameVerifier from null to DHV (BrowserCompatibleHostnameVerifier is deprecated)
                 SdkTLSSocketFactory sdkTLSSocketFactory = new SdkTLSSocketFactory(sslContext, new DefaultHostnameVerifier());
                 config.getApacheHttpClientConfig().setSslSocketFactory(sdkTLSSocketFactory);

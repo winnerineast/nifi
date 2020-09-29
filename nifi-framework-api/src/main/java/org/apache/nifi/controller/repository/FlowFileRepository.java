@@ -17,12 +17,15 @@
 package org.apache.nifi.controller.repository;
 
 import org.apache.nifi.controller.queue.FlowFileQueue;
+import org.apache.nifi.controller.repository.claim.ResourceClaim;
 import org.apache.nifi.controller.repository.claim.ResourceClaimManager;
 
 import java.io.Closeable;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * Implementations must be thread safe
@@ -83,6 +86,13 @@ public interface FlowFileRepository extends Closeable {
      * @throws IOException if load fails
      */
     long loadFlowFiles(QueueProvider queueProvider) throws IOException;
+
+    /**
+     * Searches through the repository to find the ID's of all FlowFile Queues that currently have data queued
+     * @return the set of all FlowFileQueue identifiers for which a FlowFile is queued
+     * @throws IOException if unable to read from the FlowFile Repository
+     */
+    Set<String> findQueuesWithFlowFiles(FlowFileSwapManager flowFileSwapManager) throws IOException;
 
     /**
      * @return <code>true</code> if the Repository is volatile (i.e., its data
@@ -153,4 +163,19 @@ public interface FlowFileRepository extends Closeable {
      * @return <code>true</code> if the swap location is known and valid, <code>false</code> otherwise
      */
     boolean isValidSwapLocationSuffix(String swapLocationSuffix);
+
+    /**
+     * <p>
+     * Scans the FlowFile Repository to locate any FlowFiles that reference the given Resource Claims. If the FlowFile Repository does not implement this capability, it will return <code>null</code>.
+     * </p>
+     *
+     * @param resourceClaims the resource claims whose references should be found
+     * @param swapManager the swap manager to use for scanning swap files
+     * @return a Mapping of Resource Claim to a representation of the FlowFiles/Swap Files that reference those Resource Claims
+     * @throws IOException if an IO failure occurs when attempting to find references
+     */
+    default Map<ResourceClaim, Set<ResourceClaimReference>> findResourceClaimReferences(Set<ResourceClaim> resourceClaims, FlowFileSwapManager swapManager)
+        throws IOException {
+        return null;
+    }
 }

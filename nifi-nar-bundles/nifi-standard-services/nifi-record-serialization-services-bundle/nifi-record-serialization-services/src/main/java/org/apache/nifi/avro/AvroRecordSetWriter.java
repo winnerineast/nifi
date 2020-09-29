@@ -49,6 +49,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.EnumSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
@@ -123,7 +124,7 @@ public class AvroRecordSetWriter extends SchemaRegistryRecordSetWriter implement
     }
 
     @Override
-    public RecordSetWriter createWriter(final ComponentLog logger, final RecordSchema recordSchema, final OutputStream out) throws IOException {
+    public RecordSetWriter createWriter(final ComponentLog logger, final RecordSchema recordSchema, final OutputStream out, final Map<String, String> variables) throws IOException {
         final String strategyValue = getConfigurationContext().getProperty(getSchemaWriteStrategyDescriptor()).getValue();
         final String compressionFormat = getConfigurationContext().getProperty(COMPRESSION_FORMAT).getValue();
 
@@ -147,7 +148,7 @@ public class AvroRecordSetWriter extends SchemaRegistryRecordSetWriter implement
             if (AVRO_EMBEDDED.getValue().equals(strategyValue)) {
                 return new WriteAvroResultWithSchema(avroSchema, out, getCodecFactory(compressionFormat));
             } else {
-                return new WriteAvroResultWithExternalSchema(avroSchema, recordSchema, getSchemaAccessWriter(recordSchema), out, encoderPool, getLogger());
+                return new WriteAvroResultWithExternalSchema(avroSchema, recordSchema, getSchemaAccessWriter(recordSchema, variables), out, encoderPool, getLogger());
             }
         } catch (final SchemaNotFoundException e) {
             throw new ProcessException("Could not determine the Avro Schema to use for writing the content", e);

@@ -16,29 +16,6 @@
  */
 package org.apache.nifi.processors.kafka.pubsub;
 
-import static org.apache.nifi.processors.kafka.pubsub.ConsumeKafkaRecord_0_10.REL_PARSE_FAILURE;
-import static org.apache.nifi.processors.kafka.pubsub.ConsumeKafkaRecord_0_10.REL_SUCCESS;
-import static org.apache.nifi.processors.kafka.pubsub.KafkaProcessorUtils.HEX_ENCODING;
-import static org.apache.nifi.processors.kafka.pubsub.KafkaProcessorUtils.UTF8_ENCODING;
-
-import java.io.ByteArrayInputStream;
-import java.io.Closeable;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.concurrent.TimeUnit;
-import java.util.function.BiConsumer;
-
-import javax.xml.bind.DatatypeConverter;
-
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRebalanceListener;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
@@ -59,6 +36,28 @@ import org.apache.nifi.serialization.RecordSetWriterFactory;
 import org.apache.nifi.serialization.WriteResult;
 import org.apache.nifi.serialization.record.Record;
 import org.apache.nifi.serialization.record.RecordSchema;
+
+import javax.xml.bind.DatatypeConverter;
+import java.io.ByteArrayInputStream;
+import java.io.Closeable;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
+
+import static org.apache.nifi.processors.kafka.pubsub.ConsumeKafkaRecord_0_10.REL_PARSE_FAILURE;
+import static org.apache.nifi.processors.kafka.pubsub.ConsumeKafkaRecord_0_10.REL_SUCCESS;
+import static org.apache.nifi.processors.kafka.pubsub.KafkaProcessorUtils.HEX_ENCODING;
+import static org.apache.nifi.processors.kafka.pubsub.KafkaProcessorUtils.UTF8_ENCODING;
 
 /**
  * This class represents a lease to access a Kafka Consumer object. The lease is
@@ -133,7 +132,7 @@ public abstract class ConsumerLease implements Closeable, ConsumerRebalanceListe
      */
     @Override
     public void onPartitionsRevoked(final Collection<TopicPartition> partitions) {
-        logger.debug("Rebalance Alert: Paritions '{}' revoked for lease '{}' with consumer '{}'", new Object[]{partitions, this, kafkaConsumer});
+        logger.debug("Rebalance Alert: Partitions '{}' revoked for lease '{}' with consumer '{}'", new Object[]{partitions, this, kafkaConsumer});
         //force a commit here.  Can reuse the session and consumer after this but must commit now to avoid duplicates if kafka reassigns partition
         commit();
     }
@@ -147,7 +146,7 @@ public abstract class ConsumerLease implements Closeable, ConsumerRebalanceListe
      */
     @Override
     public void onPartitionsAssigned(final Collection<TopicPartition> partitions) {
-        logger.debug("Rebalance Alert: Paritions '{}' assigned for lease '{}' with consumer '{}'", new Object[]{partitions, this, kafkaConsumer});
+        logger.debug("Rebalance Alert: Partitions '{}' assigned for lease '{}' with consumer '{}'", new Object[]{partitions, this, kafkaConsumer});
     }
 
     /**
@@ -471,7 +470,7 @@ public abstract class ConsumerLease implements Closeable, ConsumerRebalanceListe
                     final Record firstRecord;
 
                     try {
-                        reader = readerFactory.createRecordReader(Collections.emptyMap(), in, logger);
+                        reader = readerFactory.createRecordReader(Collections.emptyMap(), in, recordBytes.length, logger);
                         firstRecord = reader.nextRecord();
                     } catch (final Exception e) {
                         handleParseFailure.accept(consumerRecord, e);
@@ -508,7 +507,7 @@ public abstract class ConsumerLease implements Closeable, ConsumerRebalanceListe
                             throw new ProcessException(e);
                         }
 
-                        writer = writerFactory.createWriter(logger, writeSchema, rawOut);
+                        writer = writerFactory.createWriter(logger, writeSchema, rawOut, flowFile);
                         writer.beginRecordSet();
 
                         tracker = new BundleTracker(consumerRecord, topicPartition, keyEncoding, writer);

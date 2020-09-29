@@ -17,21 +17,15 @@
 
 package org.apache.nifi.processors.kudu;
 
-import com.google.common.annotations.VisibleForTesting;
-import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Schema;
-import org.apache.kudu.Type;
-import org.apache.kudu.client.Insert;
 import org.apache.kudu.client.KuduClient;
 import org.apache.kudu.client.KuduException;
 import org.apache.kudu.client.KuduSession;
 import org.apache.kudu.client.KuduTable;
 import org.apache.kudu.client.Operation;
 import org.apache.kudu.client.OperationResponse;
-import org.apache.kudu.client.PartialRow;
 import org.apache.kudu.client.RowError;
 import org.apache.kudu.client.SessionConfiguration;
-import org.apache.kudu.client.Upsert;
 import org.apache.nifi.annotation.behavior.EventDriven;
 import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.RequiresInstanceClassLoading;
@@ -40,30 +34,30 @@ import org.apache.nifi.annotation.behavior.WritesAttribute;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
-import org.apache.nifi.annotation.lifecycle.OnStopped;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.PropertyDescriptor.Builder;
+import org.apache.nifi.components.PropertyValue;
+import org.apache.nifi.components.ValidationContext;
+import org.apache.nifi.components.ValidationResult;
+import org.apache.nifi.components.Validator;
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
-import org.apache.nifi.kerberos.KerberosCredentialsService;
-import org.apache.nifi.processor.AbstractProcessor;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.security.krb.KerberosAction;
-import org.apache.nifi.security.krb.KerberosKeytabUser;
 import org.apache.nifi.security.krb.KerberosUser;
 import org.apache.nifi.serialization.RecordReader;
 import org.apache.nifi.serialization.RecordReaderFactory;
 import org.apache.nifi.serialization.record.Record;
+import org.apache.nifi.serialization.record.RecordField;
 import org.apache.nifi.serialization.record.RecordSet;
 
 import javax.security.auth.login.LoginException;
 import java.io.IOException;
 import java.io.InputStream;
-import java.math.BigDecimal;
 import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -73,8 +67,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
-
-import static org.apache.nifi.expression.ExpressionLanguageScope.VARIABLE_REGISTRY;
+import java.util.stream.Stream;
 
 @EventDriven
 @SupportsBatching
@@ -85,29 +78,15 @@ import static org.apache.nifi.expression.ExpressionLanguageScope.VARIABLE_REGIST
         "to the specified Kudu's table. The schema for the table must be provided in the processor properties or from your source." +
         " If any error occurs while reading records from the input, or writing records to Kudu, the FlowFile will be routed to failure")
 @WritesAttribute(attribute = "record.count", description = "Number of records written to Kudu")
-public class PutKudu extends AbstractProcessor {
-    protected static final PropertyDescriptor KUDU_MASTERS = new Builder()
-        .name("Kudu Masters")
-        .description("List all kudu masters's ip with port (e.g. 7051), comma separated")
-        .required(true)
-        .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
-        .expressionLanguageSupported(VARIABLE_REGISTRY)
-        .build();
+
+public class PutKudu extends AbstractKuduProcessor {
 
     protected static final PropertyDescriptor TABLE_NAME = new Builder()
         .name("Table Name")
         .description("The name of the Kudu Table to put data into")
         .required(true)
         .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
-        .expressionLanguageSupported(VARIABLE_REGISTRY)
-        .build();
-
-    static final PropertyDescriptor KERBEROS_CREDENTIALS_SERVICE = new Builder()
-        .name("kerberos-credentials-service")
-        .displayName("Kerberos Credentials Service")
-        .description("Specifies the Kerberos Credentials to use for authentication")
-        .required(false)
-        .identifiesControllerService(KerberosCredentialsService.class)
+        .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
         .build();
 
     public static final PropertyDescriptor RECORD_READER = new Builder()
@@ -116,6 +95,7 @@ public class PutKudu extends AbstractProcessor {
         .description("The service for reading records from incoming flow files.")
         .identifiesControllerService(RecordReaderFactory.class)
         .required(true)
+        .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
         .build();
 
     protected static final PropertyDescriptor SKIP_HEAD_LINE = new Builder()
@@ -128,12 +108,58 @@ public class PutKudu extends AbstractProcessor {
         .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
         .build();
 
+    protected static final PropertyDescriptor LOWERCASE_FIELD_NAMES = new Builder()
+            .name("Lowercase Field Names")
+            .description("Convert column names to lowercase when finding index of Kudu table columns")
+            .defaultValue("false")
+            .required(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
+            .build();
+
+    protected static final PropertyDescriptor HANDLE_SCHEMA_DRIFT = new Builder()
+            .name("Handle Schema Drift")
+            .description("If set to true, when fields with names that are not in the target Kudu table " +
+                    "are encountered, the Kudu table will be altered to include new columns for those fields.")
+            .defaultValue("false")
+            .required(true)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
+            .build();
+
+    protected static final Validator OperationTypeValidator = new Validator() {
+        @Override
+        public ValidationResult validate(String subject, String value, ValidationContext context) {
+            if (context.isExpressionLanguageSupported(subject) && context.isExpressionLanguagePresent(value)) {
+                return new ValidationResult.Builder().subject(subject).input(value)
+                        .explanation("Expression Language Present").valid(true).build();
+            }
+
+            boolean valid;
+            try {
+                OperationType.valueOf(value.toUpperCase());
+                valid = true;
+            } catch (IllegalArgumentException ex) {
+                valid = false;
+            }
+
+            final String explanation = valid ? null :
+                    "Value must be one of: " +
+                    Arrays.stream(OperationType.values()).map(Enum::toString).collect(Collectors.joining(", "));
+            return new ValidationResult.Builder().subject(subject).input(value).valid(valid)
+                    .explanation(explanation).build();
+        }
+    };
+
     protected static final PropertyDescriptor INSERT_OPERATION = new Builder()
         .name("Insert Operation")
-        .description("Specify operationType for this processor. Insert-Ignore will ignore duplicated rows")
-        .allowableValues(OperationType.values())
+        .displayName("Kudu Operation Type")
+        .description("Specify operationType for this processor.\n" +
+                "Valid values are: " +
+                Arrays.stream(OperationType.values()).map(Enum::toString).collect(Collectors.joining(", ")))
         .defaultValue(OperationType.INSERT.toString())
-        .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+        .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+        .addValidator(OperationTypeValidator)
         .build();
 
     protected static final PropertyDescriptor FLUSH_MODE = new Builder()
@@ -145,10 +171,11 @@ public class PutKudu extends AbstractProcessor {
             "MANUAL_FLUSH: the call returns when the operation has been added to the buffer, else it throws a KuduException if the buffer is full.")
         .allowableValues(SessionConfiguration.FlushMode.values())
         .defaultValue(SessionConfiguration.FlushMode.AUTO_FLUSH_BACKGROUND.toString())
+        .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
         .required(true)
         .build();
 
-    protected static final PropertyDescriptor FLOWFILE_BATCH_SIZE = new PropertyDescriptor.Builder()
+    protected static final PropertyDescriptor FLOWFILE_BATCH_SIZE = new Builder()
         .name("FlowFiles per Batch")
         .description("The maximum number of FlowFiles to process in a single execution, between 1 - 100000. " +
             "Depending on your memory size, and data size per row set an appropriate batch size " +
@@ -160,7 +187,7 @@ public class PutKudu extends AbstractProcessor {
         .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
         .build();
 
-    protected static final PropertyDescriptor BATCH_SIZE = new PropertyDescriptor.Builder()
+    protected static final PropertyDescriptor BATCH_SIZE = new Builder()
         .name("Batch Size")
         .displayName("Max Records per Batch")
         .description("The maximum number of Records to process in a single Kudu-client batch, between 1 - 100000. " +
@@ -169,9 +196,17 @@ public class PutKudu extends AbstractProcessor {
         .defaultValue("100")
         .required(true)
         .addValidator(StandardValidators.createLongValidator(1, 100000, true))
-        .expressionLanguageSupported(VARIABLE_REGISTRY)
+        .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
         .build();
 
+    protected static final PropertyDescriptor IGNORE_NULL = new Builder()
+        .name("Ignore NULL")
+        .description("Ignore NULL on Kudu Put Operation, Update only non-Null columns if set true")
+        .defaultValue("false")
+        .required(true)
+        .addValidator(StandardValidators.BOOLEAN_VALIDATOR)
+        .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+        .build();
 
     protected static final Relationship REL_SUCCESS = new Relationship.Builder()
         .name("success")
@@ -184,14 +219,10 @@ public class PutKudu extends AbstractProcessor {
 
     public static final String RECORD_COUNT_ATTR = "record.count";
 
-    protected OperationType operationType;
-    protected SessionConfiguration.FlushMode flushMode;
+    // Properties set in onScheduled.
     protected int batchSize = 100;
     protected int ffbatch   = 1;
-
-    protected KuduClient kuduClient;
-    protected KuduTable kuduTable;
-    private volatile KerberosUser kerberosUser;
+    protected SessionConfiguration.FlushMode flushMode;
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
@@ -199,13 +230,19 @@ public class PutKudu extends AbstractProcessor {
         properties.add(KUDU_MASTERS);
         properties.add(TABLE_NAME);
         properties.add(KERBEROS_CREDENTIALS_SERVICE);
+        properties.add(KERBEROS_PRINCIPAL);
+        properties.add(KERBEROS_PASSWORD);
         properties.add(SKIP_HEAD_LINE);
+        properties.add(LOWERCASE_FIELD_NAMES);
+        properties.add(HANDLE_SCHEMA_DRIFT);
         properties.add(RECORD_READER);
         properties.add(INSERT_OPERATION);
         properties.add(FLUSH_MODE);
         properties.add(FLOWFILE_BATCH_SIZE);
         properties.add(BATCH_SIZE);
-
+        properties.add(IGNORE_NULL);
+        properties.add(KUDU_OPERATION_TIMEOUT_MS);
+        properties.add(KUDU_KEEP_ALIVE_PERIOD_TIMEOUT_MS);
         return properties;
     }
 
@@ -217,60 +254,12 @@ public class PutKudu extends AbstractProcessor {
         return rels;
     }
 
-
     @OnScheduled
     public void onScheduled(final ProcessContext context) throws IOException, LoginException {
-        final String tableName = context.getProperty(TABLE_NAME).evaluateAttributeExpressions().getValue();
-        final String kuduMasters = context.getProperty(KUDU_MASTERS).evaluateAttributeExpressions().getValue();
-        operationType = OperationType.valueOf(context.getProperty(INSERT_OPERATION).getValue());
         batchSize = context.getProperty(BATCH_SIZE).evaluateAttributeExpressions().asInteger();
         ffbatch   = context.getProperty(FLOWFILE_BATCH_SIZE).evaluateAttributeExpressions().asInteger();
-        flushMode = SessionConfiguration.FlushMode.valueOf(context.getProperty(FLUSH_MODE).getValue());
-
-        getLogger().debug("Setting up Kudu connection...");
-        final KerberosCredentialsService credentialsService = context.getProperty(KERBEROS_CREDENTIALS_SERVICE).asControllerService(KerberosCredentialsService.class);
-        kuduClient = createClient(kuduMasters, credentialsService);
-        kuduTable = kuduClient.openTable(tableName);
-        getLogger().debug("Kudu connection successfully initialized");
-    }
-
-    protected KuduClient createClient(final String masters, final KerberosCredentialsService credentialsService) throws LoginException {
-        if (credentialsService == null) {
-            return buildClient(masters);
-        }
-
-        final String keytab = credentialsService.getKeytab();
-        final String principal = credentialsService.getPrincipal();
-        kerberosUser = loginKerberosUser(principal, keytab);
-
-        final KerberosAction<KuduClient> kerberosAction = new KerberosAction<>(kerberosUser, () -> buildClient(masters), getLogger());
-        return kerberosAction.execute();
-    }
-
-    protected KuduClient buildClient(final String masters) {
-        return new KuduClient.KuduClientBuilder(masters).build();
-    }
-
-    protected KerberosUser loginKerberosUser(final String principal, final String keytab) throws LoginException {
-        final KerberosUser kerberosUser = new KerberosKeytabUser(principal, keytab);
-        kerberosUser.login();
-        return kerberosUser;
-    }
-
-    @OnStopped
-    public final void closeClient() throws KuduException, LoginException {
-        try {
-            if (kuduClient != null) {
-                getLogger().debug("Closing KuduClient");
-                kuduClient.close();
-                kuduClient = null;
-            }
-        } finally {
-            if (kerberosUser != null) {
-                kerberosUser.logout();
-                kerberosUser = null;
-            }
-        }
+        flushMode = SessionConfiguration.FlushMode.valueOf(context.getProperty(FLUSH_MODE).getValue().toUpperCase());
+        createKerberosUserAndOrKuduClient(context);
     }
 
     @Override
@@ -280,43 +269,92 @@ public class PutKudu extends AbstractProcessor {
             return;
         }
 
-        final KerberosUser user = kerberosUser;
+        final KerberosUser user = getKerberosUser();
         if (user == null) {
-            trigger(context, session, flowFiles);
+            executeOnKuduClient(kuduClient -> trigger(context, session, flowFiles, kuduClient));
             return;
         }
 
-        final PrivilegedExceptionAction<Void> privelegedAction = () -> {
-            trigger(context, session, flowFiles);
+        final PrivilegedExceptionAction<Void> privilegedAction = () -> {
+            executeOnKuduClient(kuduClient -> trigger(context, session, flowFiles, kuduClient));
             return null;
         };
 
-        final KerberosAction<Void> action = new KerberosAction<>(user, privelegedAction, getLogger());
+        final KerberosAction<Void> action = new KerberosAction<>(user, privilegedAction, getLogger());
         action.execute();
     }
 
-    private void trigger(final ProcessContext context, final ProcessSession session, final List<FlowFile> flowFiles) throws ProcessException {
-        final KuduSession kuduSession = getKuduSession(kuduClient);
+    private void trigger(final ProcessContext context, final ProcessSession session, final List<FlowFile> flowFiles, KuduClient kuduClient) throws ProcessException {
         final RecordReaderFactory recordReaderFactory = context.getProperty(RECORD_READER).asControllerService(RecordReaderFactory.class);
+
+        final KuduSession kuduSession = createKuduSession(kuduClient);
 
         final Map<FlowFile, Integer> numRecords = new HashMap<>();
         final Map<FlowFile, Object> flowFileFailures = new HashMap<>();
         final Map<Operation, FlowFile> operationFlowFileMap = new HashMap<>();
 
         int numBuffered = 0;
+        OperationType prevOperationType = OperationType.INSERT;
         final List<RowError> pendingRowErrors = new ArrayList<>();
         for (FlowFile flowFile : flowFiles) {
             try (final InputStream in = session.read(flowFile);
-                 final RecordReader recordReader = recordReaderFactory.createRecordReader(flowFile, in, getLogger())) {
-                final List<String> fieldNames = recordReader.getSchema().getFieldNames();
+                final RecordReader recordReader = recordReaderFactory.createRecordReader(flowFile, in, getLogger())) {
+
+                final String tableName = getEvaluatedProperty(TABLE_NAME, context, flowFile);
+                final OperationType operationType = OperationType.valueOf(getEvaluatedProperty(INSERT_OPERATION, context, flowFile).toUpperCase());
+                final Boolean ignoreNull = Boolean.valueOf(getEvaluatedProperty(IGNORE_NULL, context, flowFile));
+                final Boolean lowercaseFields = Boolean.valueOf(getEvaluatedProperty(LOWERCASE_FIELD_NAMES, context, flowFile));
+                final Boolean handleSchemaDrift = Boolean.valueOf(getEvaluatedProperty(HANDLE_SCHEMA_DRIFT, context, flowFile));
+
                 final RecordSet recordSet = recordReader.createRecordSet();
+                final List<String> fieldNames = recordReader.getSchema().getFieldNames();
+                KuduTable kuduTable = kuduClient.openTable(tableName);
+
+                // If handleSchemaDrift is true, check for any missing columns and alter the Kudu table to add them.
+                if (handleSchemaDrift) {
+                    final Schema schema = kuduTable.getSchema();
+                    Stream<RecordField> fields = recordReader.getSchema().getFields().stream();
+                    List<RecordField> missing = fields.filter(field -> !schema.hasColumn(
+                            lowercaseFields ? field.getFieldName().toLowerCase() : field.getFieldName()))
+                            .collect(Collectors.toList());
+                    if (!missing.isEmpty()) {
+                        getLogger().info("adding {} columns to table '{}' to handle schema drift",
+                                new Object[]{missing.size(), tableName});
+                        // Add each column one at a time to avoid failing if some of the missing columns
+                        // we created by a concurrent thread or application attempting to handle schema drift.
+                        for (RecordField field : missing) {
+                            try {
+                                final String columnName = lowercaseFields ? field.getFieldName().toLowerCase() : field.getFieldName();
+                                kuduClient.alterTable(tableName, getAddNullableColumnStatement(columnName, field.getDataType()));
+                            } catch (KuduException e) {
+                                // Ignore the exception if the column already exists due to concurrent
+                                // threads or applications attempting to handle schema drift.
+                                if (e.getStatus().isAlreadyPresent()) {
+                                    getLogger().info("column already exists in table '{}' while handling schema drift",
+                                            new Object[]{tableName});
+                                } else {
+                                    throw new ProcessException(e);
+                                }
+                            }
+                        }
+                        // Re-open the table to get the new schema.
+                        kuduTable = kuduClient.openTable(tableName);
+                    }
+                }
+
+                // In the case of INSERT_IGNORE the Kudu session is modified to ignore row errors.
+                // Because the session is shared across flow files, for batching efficiency, we
+                // need to flush when changing to and from INSERT_IGNORE operation types.
+                // This should be updated and simplified when KUDU-1563 is completed.
+                if (prevOperationType != operationType && (prevOperationType == OperationType.INSERT_IGNORE || operationType == OperationType.INSERT_IGNORE)) {
+                    flushKuduSession(kuduSession, false, pendingRowErrors);
+                    kuduSession.setIgnoreAllDuplicateRows(operationType == OperationType.INSERT_IGNORE);
+                }
+                prevOperationType = operationType;
 
                 Record record = recordSet.next();
                 while (record != null) {
-                    Operation operation = operationType == OperationType.UPSERT
-                        ? upsertRecordToKudu(kuduTable, record, fieldNames)
-                        : insertRecordToKudu(kuduTable, record, fieldNames);
-
+                    Operation operation = createKuduOperation(operationType, record, fieldNames, ignoreNull, lowercaseFields, kuduTable);
                     // We keep track of mappings between Operations and their origins,
                     // so that we know which FlowFiles should be marked failure after buffered flush.
                     operationFlowFileMap.put(operation, flowFile);
@@ -390,105 +428,36 @@ public class PutKudu extends AbstractProcessor {
         session.adjustCounter("Records Inserted", totalCount, false);
     }
 
+    private String getEvaluatedProperty(PropertyDescriptor property, ProcessContext context, FlowFile flowFile) {
+        PropertyValue evaluatedProperty = context.getProperty(property).evaluateAttributeExpressions(flowFile);
+        if (property.isRequired() && evaluatedProperty == null) {
+            throw new ProcessException(String.format("Property `%s` is required but evaluated to null", property.getDisplayName()));
+        }
+        return evaluatedProperty.getValue();
+    }
 
-    protected KuduSession getKuduSession(final KuduClient client) {
+    protected KuduSession createKuduSession(final KuduClient client) {
         final KuduSession kuduSession = client.newSession();
         kuduSession.setMutationBufferSpace(batchSize);
         kuduSession.setFlushMode(flushMode);
-
-        if (operationType == OperationType.INSERT_IGNORE) {
-            kuduSession.setIgnoreAllDuplicateRows(true);
-        }
-
         return kuduSession;
     }
 
-    private void flushKuduSession(final KuduSession kuduSession, boolean close, final List<RowError> rowErrors) throws KuduException {
-        final List<OperationResponse> responses = close ? kuduSession.close() : kuduSession.flush();
-
-        if (kuduSession.getFlushMode() == SessionConfiguration.FlushMode.AUTO_FLUSH_BACKGROUND) {
-            rowErrors.addAll(Arrays.asList(kuduSession.getPendingErrors().getRowErrors()));
-        } else {
-            responses.stream()
-                .filter(OperationResponse::hasRowError)
-                .map(OperationResponse::getRowError)
-                .forEach(rowErrors::add);
-        }
-    }
-
-
-
-    protected Upsert upsertRecordToKudu(KuduTable kuduTable, Record record, List<String> fieldNames) {
-        Upsert upsert = kuduTable.newUpsert();
-        this.buildPartialRow(kuduTable.getSchema(), upsert.getRow(), record, fieldNames);
-        return upsert;
-    }
-
-    protected Insert insertRecordToKudu(KuduTable kuduTable, Record record, List<String> fieldNames) {
-        Insert insert = kuduTable.newInsert();
-        this.buildPartialRow(kuduTable.getSchema(), insert.getRow(), record, fieldNames);
-        return insert;
-    }
-
-    @VisibleForTesting
-    void buildPartialRow(Schema schema, PartialRow row, Record record, List<String> fieldNames) {
-        for (String colName : fieldNames) {
-            int colIdx = this.getColumnIndex(schema, colName);
-            if (colIdx != -1) {
-                ColumnSchema colSchema = schema.getColumnByIndex(colIdx);
-                Type colType = colSchema.getType();
-
-                if (record.getValue(colName) == null) {
-                    row.setNull(colName);
-                    continue;
-                }
-
-                switch (colType.getDataType(colSchema.getTypeAttributes())) {
-                    case BOOL:
-                        row.addBoolean(colIdx, record.getAsBoolean(colName));
-                        break;
-                    case FLOAT:
-                        row.addFloat(colIdx, record.getAsFloat(colName));
-                        break;
-                    case DOUBLE:
-                        row.addDouble(colIdx, record.getAsDouble(colName));
-                        break;
-                    case BINARY:
-                        row.addBinary(colIdx, record.getAsString(colName).getBytes());
-                        break;
-                    case INT8:
-                        row.addByte(colIdx, record.getAsInt(colName).byteValue());
-                        break;
-                    case INT16:
-                        row.addShort(colIdx, record.getAsInt(colName).shortValue());
-                        break;
-                    case INT32:
-                        row.addInt(colIdx, record.getAsInt(colName));
-                        break;
-                    case INT64:
-                    case UNIXTIME_MICROS:
-                        row.addLong(colIdx, record.getAsLong(colName));
-                        break;
-                    case STRING:
-                        row.addString(colIdx, record.getAsString(colName));
-                        break;
-                    case DECIMAL32:
-                    case DECIMAL64:
-                    case DECIMAL128:
-                        row.addDecimal(colIdx, new BigDecimal(record.getAsString(colName)));
-                        break;
-                    default:
-                        throw new IllegalStateException(String.format("unknown column type %s", colType));
-                }
-            }
-        }
-    }
-
-    private int getColumnIndex(Schema columns, String colName) {
-        try {
-            return columns.getColumnIndex(colName);
-        } catch (Exception ex) {
-            return -1;
+    private Operation createKuduOperation(OperationType operationType, Record record,
+                                          List<String> fieldNames, Boolean ignoreNull,
+                                          Boolean lowercaseFields, KuduTable kuduTable) {
+        switch (operationType) {
+            case DELETE:
+                return deleteRecordFromKudu(kuduTable, record, fieldNames, ignoreNull, lowercaseFields);
+            case INSERT:
+            case INSERT_IGNORE:
+                return insertRecordToKudu(kuduTable, record, fieldNames, ignoreNull, lowercaseFields);
+            case UPSERT:
+                return upsertRecordToKudu(kuduTable, record, fieldNames, ignoreNull, lowercaseFields);
+            case UPDATE:
+                return updateRecordToKudu(kuduTable, record, fieldNames, ignoreNull, lowercaseFields);
+            default:
+                throw new IllegalArgumentException(String.format("OperationType: %s not supported by Kudu", operationType));
         }
     }
 }

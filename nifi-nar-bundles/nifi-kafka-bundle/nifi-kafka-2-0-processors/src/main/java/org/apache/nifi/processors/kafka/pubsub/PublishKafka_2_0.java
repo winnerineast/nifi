@@ -18,6 +18,9 @@
 package org.apache.nifi.processors.kafka.pubsub;
 
 import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.common.errors.AuthorizationException;
+import org.apache.kafka.common.errors.OutOfOrderSequenceException;
+import org.apache.kafka.common.errors.ProducerFencedException;
 import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.nifi.annotation.behavior.DynamicProperty;
 import org.apache.nifi.annotation.behavior.InputRequirement;
@@ -54,9 +57,13 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
+
+import static org.apache.nifi.expression.ExpressionLanguageScope.FLOWFILE_ATTRIBUTES;
 
 @Tags({"Apache", "Kafka", "Put", "Send", "Message", "PubSub", "2.0"})
 @CapabilityDescription("Sends the contents of a FlowFile as a message to Apache Kafka using the Kafka 2.0 Producer API."
@@ -92,6 +99,9 @@ public class PublishKafka_2_0 extends AbstractProcessor {
             + "the next Partition to Partition 2, and so on, wrapping as necessary.");
     static final AllowableValue RANDOM_PARTITIONING = new AllowableValue("org.apache.kafka.clients.producer.internals.DefaultPartitioner",
         "DefaultPartitioner", "Messages will be assigned to random partitions.");
+    static final AllowableValue EXPRESSION_LANGUAGE_PARTITIONING = new AllowableValue(Partitioners.ExpressionLanguagePartitioner.class.getName(), "Expression Language Partitioner",
+        "Interprets the <Partition> property as Expression Language that will be evaluated against each FlowFile. This Expression will be evaluated once against the FlowFile, " +
+            "so all Records in a given FlowFile will go to the same partition.");
 
     static final AllowableValue UTF8_ENCODING = new AllowableValue("utf-8", "UTF-8 Encoded", "The key is interpreted as a UTF-8 Encoded string.");
     static final AllowableValue HEX_ENCODING = new AllowableValue("hex", "Hex Encoded",
@@ -185,9 +195,18 @@ public class PublishKafka_2_0 extends AbstractProcessor {
         .name(ProducerConfig.PARTITIONER_CLASS_CONFIG)
         .displayName("Partitioner class")
         .description("Specifies which class to use to compute a partition id for a message. Corresponds to Kafka's 'partitioner.class' property.")
-        .allowableValues(ROUND_ROBIN_PARTITIONING, RANDOM_PARTITIONING)
+        .allowableValues(ROUND_ROBIN_PARTITIONING, RANDOM_PARTITIONING, EXPRESSION_LANGUAGE_PARTITIONING)
         .defaultValue(RANDOM_PARTITIONING.getValue())
         .required(false)
+        .build();
+
+    static final PropertyDescriptor PARTITION = new PropertyDescriptor.Builder()
+        .name("partition")
+        .displayName("Partition")
+        .description("Specifies which Partition Records will go to.")
+        .required(false)
+        .addValidator(StandardValidators.NON_EMPTY_VALIDATOR)
+        .expressionLanguageSupported(FLOWFILE_ATTRIBUTES)
         .build();
 
     static final PropertyDescriptor COMPRESSION_CODEC = new PropertyDescriptor.Builder()
@@ -222,6 +241,14 @@ public class PublishKafka_2_0 extends AbstractProcessor {
         .defaultValue("true")
         .required(true)
         .build();
+    static final PropertyDescriptor TRANSACTIONAL_ID_PREFIX = new PropertyDescriptor.Builder()
+        .name("transactional-id-prefix")
+        .displayName("Transactional Id Prefix")
+        .description("When Use Transaction is set to true, KafkaProducer config 'transactional.id' will be a generated UUID and will be prefixed with this string.")
+        .expressionLanguageSupported(ExpressionLanguageScope.VARIABLE_REGISTRY)
+        .addValidator(StandardValidators.NON_EMPTY_EL_VALIDATOR)
+        .required(false)
+        .build();
     static final PropertyDescriptor MESSAGE_HEADER_ENCODING = new PropertyDescriptor.Builder()
         .name("message-header-encoding")
         .displayName("Message Header Encoding")
@@ -253,6 +280,7 @@ public class PublishKafka_2_0 extends AbstractProcessor {
         properties.add(TOPIC);
         properties.add(DELIVERY_GUARANTEE);
         properties.add(USE_TRANSACTIONS);
+        properties.add(TRANSACTIONAL_ID_PREFIX);
         properties.add(ATTRIBUTE_NAME_REGEX);
         properties.add(MESSAGE_HEADER_ENCODING);
         properties.add(KEY);
@@ -262,6 +290,7 @@ public class PublishKafka_2_0 extends AbstractProcessor {
         properties.add(ACK_WAIT_TIME);
         properties.add(METADATA_WAIT_TIME);
         properties.add(PARTITION_CLASS);
+        properties.add(PARTITION);
         properties.add(COMPRESSION_CODEC);
 
         PROPERTIES = Collections.unmodifiableList(properties);
@@ -311,6 +340,18 @@ public class PublishKafka_2_0 extends AbstractProcessor {
             }
         }
 
+        final String partitionClass = validationContext.getProperty(PARTITION_CLASS).getValue();
+        if (EXPRESSION_LANGUAGE_PARTITIONING.getValue().equals(partitionClass)) {
+            final String rawRecordPath = validationContext.getProperty(PARTITION).getValue();
+            if (rawRecordPath == null) {
+                results.add(new ValidationResult.Builder()
+                    .subject("Partition")
+                    .valid(false)
+                    .explanation("The <Partition> property must be specified if using the Expression Language Partitioning class")
+                    .build());
+            }
+        }
+
         return results;
     }
 
@@ -330,6 +371,8 @@ public class PublishKafka_2_0 extends AbstractProcessor {
         final String attributeNameRegex = context.getProperty(ATTRIBUTE_NAME_REGEX).getValue();
         final Pattern attributeNamePattern = attributeNameRegex == null ? null : Pattern.compile(attributeNameRegex);
         final boolean useTransactions = context.getProperty(USE_TRANSACTIONS).asBoolean();
+        final String transactionalIdPrefix = context.getProperty(TRANSACTIONAL_ID_PREFIX).evaluateAttributeExpressions().getValue();
+        Supplier<String> transactionalIdSupplier = KafkaProcessorUtils.getTransactionalIdSupplier(transactionalIdPrefix);
 
         final String charsetName = context.getProperty(MESSAGE_HEADER_ENCODING).evaluateAttributeExpressions().getValue();
         final Charset charset = Charset.forName(charsetName);
@@ -340,7 +383,7 @@ public class PublishKafka_2_0 extends AbstractProcessor {
         kafkaProperties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
         kafkaProperties.put("max.request.size", String.valueOf(maxMessageSize));
 
-        return new PublisherPool(kafkaProperties, getLogger(), maxMessageSize, maxAckWaitMillis, useTransactions, attributeNamePattern, charset);
+        return new PublisherPool(kafkaProperties, getLogger(), maxMessageSize, maxAckWaitMillis, useTransactions, transactionalIdSupplier, attributeNamePattern, charset);
     }
 
     @OnStopped
@@ -373,64 +416,72 @@ public class PublishKafka_2_0 extends AbstractProcessor {
 
         final long startTime = System.nanoTime();
         try (final PublisherLease lease = pool.obtainPublisher()) {
-            if (useTransactions) {
-                lease.beginTransaction();
-            }
-
-            // Send each FlowFile to Kafka asynchronously.
-            for (final FlowFile flowFile : flowFiles) {
-                if (!isScheduled()) {
-                    // If stopped, re-queue FlowFile instead of sending it
-                    if (useTransactions) {
-                        session.rollback();
-                        lease.rollback();
-                        return;
-                    }
-
-                    session.transfer(flowFile);
-                    continue;
+            try {
+                if (useTransactions) {
+                    lease.beginTransaction();
                 }
 
-                final byte[] messageKey = getMessageKey(flowFile, context);
-                final String topic = context.getProperty(TOPIC).evaluateAttributeExpressions(flowFile).getValue();
-                final byte[] demarcatorBytes;
-                if (useDemarcator) {
-                    demarcatorBytes = context.getProperty(MESSAGE_DEMARCATOR).evaluateAttributeExpressions(flowFile).getValue().getBytes(StandardCharsets.UTF_8);
-                } else {
-                    demarcatorBytes = null;
-                }
-
-                session.read(flowFile, new InputStreamCallback() {
-                    @Override
-                    public void process(final InputStream rawIn) throws IOException {
-                        try (final InputStream in = new BufferedInputStream(rawIn)) {
-                            lease.publish(flowFile, in, messageKey, demarcatorBytes, topic);
+                // Send each FlowFile to Kafka asynchronously.
+                for (final FlowFile flowFile : flowFiles) {
+                    if (!isScheduled()) {
+                        // If stopped, re-queue FlowFile instead of sending it
+                        if (useTransactions) {
+                            session.rollback();
+                            lease.rollback();
+                            return;
                         }
+
+                        session.transfer(flowFile);
+                        continue;
                     }
-                });
-            }
 
-            // Complete the send
-            final PublishResult publishResult = lease.complete();
+                    final byte[] messageKey = getMessageKey(flowFile, context);
+                    final String topic = context.getProperty(TOPIC).evaluateAttributeExpressions(flowFile).getValue();
+                    final byte[] demarcatorBytes;
+                    if (useDemarcator) {
+                        demarcatorBytes = context.getProperty(MESSAGE_DEMARCATOR).evaluateAttributeExpressions(flowFile).getValue().getBytes(StandardCharsets.UTF_8);
+                    } else {
+                        demarcatorBytes = null;
+                    }
 
-            if (publishResult.isFailure()) {
-                getLogger().info("Failed to send FlowFile to kafka; transferring to failure");
+                    final Integer partition = getPartition(context, flowFile);
+                    session.read(flowFile, new InputStreamCallback() {
+                        @Override
+                        public void process(final InputStream rawIn) throws IOException {
+                            try (final InputStream in = new BufferedInputStream(rawIn)) {
+                                lease.publish(flowFile, in, messageKey, demarcatorBytes, topic, partition);
+                            }
+                        }
+                    });
+                }
+
+                // Complete the send
+                final PublishResult publishResult = lease.complete();
+
+                if (publishResult.isFailure()) {
+                    getLogger().info("Failed to send FlowFile to kafka; transferring to failure");
+                    session.transfer(flowFiles, REL_FAILURE);
+                    return;
+                }
+
+                // Transfer any successful FlowFiles.
+                final long transmissionMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startTime);
+                for (FlowFile success : flowFiles) {
+                    final String topic = context.getProperty(TOPIC).evaluateAttributeExpressions(success).getValue();
+
+                    final int msgCount = publishResult.getSuccessfulMessageCount(success);
+                    success = session.putAttribute(success, MSG_COUNT, String.valueOf(msgCount));
+                    session.adjustCounter("Messages Sent", msgCount, true);
+
+                    final String transitUri = KafkaProcessorUtils.buildTransitURI(securityProtocol, bootstrapServers, topic);
+                    session.getProvenanceReporter().send(success, transitUri, "Sent " + msgCount + " messages", transmissionMillis);
+                    session.transfer(success, REL_SUCCESS);
+                }
+            } catch (final ProducerFencedException | OutOfOrderSequenceException | AuthorizationException e) {
+                lease.poison();
+                getLogger().error("Failed to send messages to Kafka; will yield Processor and transfer FlowFiles to failure");
                 session.transfer(flowFiles, REL_FAILURE);
-                return;
-            }
-
-            // Transfer any successful FlowFiles.
-            final long transmissionMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startTime);
-            for (FlowFile success : flowFiles) {
-                final String topic = context.getProperty(TOPIC).evaluateAttributeExpressions(success).getValue();
-
-                final int msgCount = publishResult.getSuccessfulMessageCount(success);
-                success = session.putAttribute(success, MSG_COUNT, String.valueOf(msgCount));
-                session.adjustCounter("Messages Sent", msgCount, true);
-
-                final String transitUri = KafkaProcessorUtils.buildTransitURI(securityProtocol, bootstrapServers, topic);
-                session.getProvenanceReporter().send(success, transitUri, "Sent " + msgCount + " messages", transmissionMillis);
-                session.transfer(success, REL_SUCCESS);
+                context.yield();
             }
         }
     }
@@ -456,4 +507,16 @@ public class PublishKafka_2_0 extends AbstractProcessor {
 
         return DatatypeConverter.parseHexBinary(uninterpretedKey);
     }
+
+    private Integer getPartition(final ProcessContext context, final FlowFile flowFile) {
+        final String partitionClass = context.getProperty(PARTITION_CLASS).getValue();
+        if (EXPRESSION_LANGUAGE_PARTITIONING.getValue().equals(partitionClass)) {
+            final String partition = context.getProperty(PARTITION).evaluateAttributeExpressions(flowFile).getValue();
+            final int hash = Objects.hashCode(partition);
+            return hash;
+        }
+
+        return null;
+    }
+
 }

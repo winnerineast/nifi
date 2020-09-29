@@ -19,8 +19,8 @@ package org.apache.nifi.processors.azure.eventhub;
 import com.microsoft.azure.eventhubs.EventData;
 import com.microsoft.azure.eventhubs.EventData.SystemProperties;
 import com.microsoft.azure.eventhubs.PartitionReceiver;
-import com.microsoft.azure.servicebus.ServiceBusException;
-import com.microsoft.azure.servicebus.amqp.AmqpConstants;
+import com.microsoft.azure.eventhubs.EventHubException;
+import com.microsoft.azure.eventhubs.impl.AmqpConstants;
 
 import java.io.IOException;
 import java.time.Clock;
@@ -30,6 +30,7 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.LinkedList;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
 
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.exception.ProcessException;
@@ -38,11 +39,8 @@ import org.apache.nifi.util.TestRunner;
 import org.apache.nifi.util.TestRunners;
 import org.junit.Before;
 import org.junit.Test;
-import org.mockito.internal.util.reflection.Whitebox;
-
 
 public class GetAzureEventHubTest {
-
     private static final String namespaceName = "nifi-azure-hub";
     private static final String eventHubName = "get-test";
     private static final String sasKeyName = "bogus-policy";
@@ -80,7 +78,23 @@ public class GetAzureEventHubTest {
         testRunner.setProperty(GetAzureEventHub.RECEIVER_FETCH_TIMEOUT,"10000");
         testRunner.assertValid();
     }
-
+    @Test
+    public void testProcessorConfigValidityWithManagedIdentityFlag() {
+        testRunner.setProperty(PutAzureEventHub.EVENT_HUB_NAME,eventHubName);
+        testRunner.assertNotValid();
+        testRunner.setProperty(PutAzureEventHub.NAMESPACE,namespaceName);
+        testRunner.assertNotValid();
+        testRunner.setProperty(PutAzureEventHub.USE_MANAGED_IDENTITY,"true");
+        testRunner.assertNotValid();
+        testRunner.setProperty(GetAzureEventHub.NUM_PARTITIONS,"4");
+        testRunner.assertValid();
+        testRunner.setProperty(GetAzureEventHub.ENQUEUE_TIME,"2015-12-22T21:55:10.000Z");
+        testRunner.assertValid();
+        testRunner.setProperty(GetAzureEventHub.RECEIVER_FETCH_SIZE, "5");
+        testRunner.assertValid();
+        testRunner.setProperty(GetAzureEventHub.RECEIVER_FETCH_TIMEOUT,"10000");
+        testRunner.assertValid();
+    }
     @Test
     public void verifyRelationships(){
         assert(1 == processor.getRelationships().size());
@@ -157,11 +171,11 @@ public class GetAzureEventHubTest {
         boolean received = true;
 
         @Override
-        protected void setupReceiver(final String connectionString) throws ProcessException{
+        protected void setupReceiver(final String connectionString, final ScheduledExecutorService executor) throws ProcessException{
             //do nothing
         }
         @Override
-        protected PartitionReceiver getReceiver(final ProcessContext context, final String partitionId) throws IOException, ServiceBusException, ExecutionException, InterruptedException {
+        protected PartitionReceiver getReceiver(final ProcessContext context, final String partitionId) throws IOException, EventHubException, ExecutionException, InterruptedException {
             if(getReceiverThrow){
                 throw new IOException("Could not create receiver");
             }
@@ -178,7 +192,7 @@ public class GetAzureEventHubTest {
             }
             final LinkedList<EventData> receivedEvents = new LinkedList<>();
             for(int i = 0; i < 10; i++){
-                EventData eventData = new EventData(String.format("test event number: %d", i).getBytes());
+                EventData eventData = EventData.create(String.format("test event number: %d", i).getBytes());
                 if (received) {
                     HashMap<String, Object> properties = new HashMap<>();
                     properties.put(AmqpConstants.PARTITION_KEY_ANNOTATION_NAME, PARTITION_KEY_VALUE);
@@ -187,21 +201,18 @@ public class GetAzureEventHubTest {
                     properties.put(AmqpConstants.ENQUEUED_TIME_UTC_ANNOTATION_NAME, ENQUEUED_TIME_VALUE);
 
                     SystemProperties systemProperties = new SystemProperties(properties);
-                    Whitebox.setInternalState(eventData, "systemProperties", systemProperties);
+                    eventData.setSystemProperties(systemProperties);
                 }
                 receivedEvents.add(eventData);
             }
 
             return receivedEvents;
-
         }
     }
 
     public static class MockGetAzureEventHubNoPartitions extends GetAzureEventHub{
-
-
         @Override
-        protected void setupReceiver(final String connectionString) throws ProcessException{
+        protected void setupReceiver(final String connectionString, final ScheduledExecutorService executor) throws ProcessException{
             //do nothing
         }
 
@@ -209,10 +220,10 @@ public class GetAzureEventHubTest {
         public void onScheduled(final ProcessContext context) throws ProcessException {
 
         }
+        @Override
+        public void tearDown() throws ProcessException {
+        }
     }
-
-
-
     private void setUpStandardTestConfig() {
         testRunner.setProperty(GetAzureEventHub.EVENT_HUB_NAME,eventHubName);
         testRunner.setProperty(GetAzureEventHub.NAMESPACE,namespaceName);
@@ -221,5 +232,4 @@ public class GetAzureEventHubTest {
         testRunner.setProperty(GetAzureEventHub.NUM_PARTITIONS,"4");
         testRunner.assertValid();
     }
-
 }

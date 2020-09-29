@@ -44,6 +44,7 @@ import org.apache.nifi.serialization.record.SchemaIdentifier;
 import org.apache.nifi.serialization.record.StandardSchemaIdentifier;
 import org.apache.nifi.serialization.record.type.ArrayDataType;
 import org.apache.nifi.serialization.record.type.ChoiceDataType;
+import org.apache.nifi.serialization.record.type.DecimalDataType;
 import org.apache.nifi.serialization.record.type.MapDataType;
 import org.apache.nifi.serialization.record.type.RecordDataType;
 import org.apache.nifi.serialization.record.util.DataTypeUtils;
@@ -60,6 +61,7 @@ import java.sql.Blob;
 import java.sql.Time;
 import java.sql.Timestamp;
 import java.time.Duration;
+import java.time.LocalDate;
 import java.time.temporal.ChronoUnit;
 import java.util.AbstractMap;
 import java.util.ArrayList;
@@ -73,6 +75,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 
 public class AvroTypeUtil {
     private static final Logger logger = LoggerFactory.getLogger(AvroTypeUtil.class);
@@ -254,6 +257,11 @@ public class AvroTypeUtil {
             case LONG:
                 schema = Schema.create(Type.LONG);
                 break;
+            case DECIMAL:
+                final DecimalDataType decimalDataType = (DecimalDataType) dataType;
+                schema = Schema.create(Type.BYTES);
+                LogicalTypes.decimal(decimalDataType.getPrecision(), decimalDataType.getScale()).addToSchema(schema);
+                break;
             case MAP:
                 schema = Schema.createMap(buildAvroSchema(((MapDataType) dataType).getValueType(), fieldName, false));
                 break;
@@ -339,9 +347,8 @@ public class AvroTypeUtil {
                 case LOGICAL_TYPE_TIMESTAMP_MICROS:
                     return RecordFieldType.TIMESTAMP.getDataType();
                 case LOGICAL_TYPE_DECIMAL:
-                    // We convert Decimal to Double.
-                    // Alternatively we could convert it to String, but numeric type is generally more preferable by users.
-                    return RecordFieldType.DOUBLE.getDataType();
+                    final LogicalTypes.Decimal decimal = (LogicalTypes.Decimal) logicalType;
+                    return RecordFieldType.DECIMAL.getDecimalDataType(decimal.getPrecision(), decimal.getScale());
             }
         }
 
@@ -624,7 +631,7 @@ public class AvroTypeUtil {
             recordFields.add(new RecordField(fieldName, dataType, field.aliases(), nullable));
         } else {
             Object defaultValue = field.defaultVal();
-            if (fieldSchema.getType() == Schema.Type.ARRAY && !DataTypeUtils.isArrayTypeCompatible(defaultValue, ((ArrayDataType) dataType).getElementType())) {
+            if (defaultValue != null && fieldSchema.getType() == Schema.Type.ARRAY && !DataTypeUtils.isArrayTypeCompatible(defaultValue, ((ArrayDataType) dataType).getElementType())) {
                 defaultValue = defaultValue instanceof List ? ((List<?>) defaultValue).toArray() : new Object[0];
             }
             recordFields.add(new RecordField(fieldName, dataType, defaultValue, field.aliases(), nullable));
@@ -652,9 +659,8 @@ public class AvroTypeUtil {
 
                 if (LOGICAL_TYPE_DATE.equals(logicalType.getName())) {
                     final String format = AvroTypeUtil.determineDataType(fieldSchema).getFormat();
-                    final Date date = DataTypeUtils.toDate(rawValue, () -> DataTypeUtils.getDateFormat(format), fieldName);
-                    final Duration duration = Duration.between(new Date(0L).toInstant(), new Date(date.getTime()).toInstant());
-                    final long days = duration.toDays();
+                    final java.sql.Date date = DataTypeUtils.toDate(rawValue, () -> DataTypeUtils.getDateFormat(format), fieldName);
+                    final long days = ChronoUnit.DAYS.between(LocalDate.ofEpochDay(0), date.toLocalDate());
                     return (int) days;
                 } else if (LOGICAL_TYPE_TIME_MILLIS.equals(logicalType.getName())) {
                     final String format = AvroTypeUtil.determineDataType(fieldSchema).getFormat();
@@ -679,8 +685,6 @@ public class AvroTypeUtil {
                     final Duration duration = Duration.between(date.toInstant().truncatedTo(ChronoUnit.DAYS), date.toInstant());
                     return duration.toMillis() * 1000L;
                 } else if (LOGICAL_TYPE_TIMESTAMP_MILLIS.equals(logicalType.getName())) {
-                    final String format = AvroTypeUtil.determineDataType(fieldSchema).getFormat();
-                    Timestamp t = DataTypeUtils.toTimestamp(rawValue, () -> DataTypeUtils.getDateFormat(format), fieldName);
                     return getLongFromTimestamp(rawValue, fieldSchema, fieldName);
                 } else if (LOGICAL_TYPE_TIMESTAMP_MICROS.equals(logicalType.getName())) {
                     return getLongFromTimestamp(rawValue, fieldSchema, fieldName) * 1000L;
@@ -748,7 +752,7 @@ public class AvroTypeUtil {
                     for (final RecordField recordField : recordValue.getSchema().getFields()) {
                         final Object v = recordValue.getValue(recordField);
                         if (v != null) {
-                            map.put(recordField.getFieldName(), v);
+                            map.put(recordField.getFieldName(), convertToAvroObject(v, fieldSchema.getValueType(), fieldName + "[" + recordField.getFieldName() + "]", charset));
                         }
                     }
 
@@ -879,6 +883,16 @@ public class AvroTypeUtil {
      */
     private static Object convertUnionFieldValue(final Object originalValue, final Schema fieldSchema, final Function<Schema, Object> conversion, final String fieldName) {
         boolean foundNonNull = false;
+
+        Optional<Schema> mostSuitableType = DataTypeUtils.findMostSuitableType(
+                originalValue,
+                fieldSchema.getTypes().stream().filter(schema -> schema.getType() != Type.NULL).collect(Collectors.toList()),
+                subSchema -> AvroTypeUtil.determineDataType(subSchema)
+        );
+        if (mostSuitableType.isPresent()) {
+            return conversion.apply(mostSuitableType.get());
+        }
+
         for (final Schema subSchema : fieldSchema.getTypes()) {
             if (subSchema.getType() == Type.NULL) {
                 continue;
@@ -1014,6 +1028,11 @@ public class AvroTypeUtil {
                 return AvroTypeUtil.convertByteArray(bb.array());
             case FIXED:
                 final GenericFixed fixed = (GenericFixed) value;
+                final LogicalType fixedLogicalType = avroSchema.getLogicalType();
+                if (fixedLogicalType != null && LOGICAL_TYPE_DECIMAL.equals(fixedLogicalType.getName())) {
+                    final ByteBuffer fixedByteBuffer = ByteBuffer.wrap(fixed.bytes());
+                    return new Conversions.DecimalConversion().fromBytes(fixedByteBuffer, avroSchema, fixedLogicalType);
+                }
                 return AvroTypeUtil.convertByteArray(fixed.bytes());
             case ENUM:
                 return value.toString();

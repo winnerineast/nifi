@@ -18,7 +18,6 @@
 package org.apache.nifi.processors.standard;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -27,7 +26,13 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Paths;
+import java.util.HashMap;
+import java.util.Map;
 
+import org.apache.commons.lang3.SystemUtils;
+import org.apache.nifi.csv.CSVReader;
+import org.apache.nifi.csv.CSVRecordSetWriter;
+import org.apache.nifi.csv.CSVUtils;
 import org.apache.nifi.json.JsonRecordSetWriter;
 import org.apache.nifi.json.JsonTreeReader;
 import org.apache.nifi.reporting.InitializationException;
@@ -38,10 +43,18 @@ import org.apache.nifi.serialization.record.RecordFieldType;
 import org.apache.nifi.util.MockFlowFile;
 import org.apache.nifi.util.TestRunner;
 import org.apache.nifi.util.TestRunners;
+import org.junit.Assume;
+import org.junit.BeforeClass;
 import org.junit.Test;
 import org.xerial.snappy.SnappyInputStream;
 
 public class TestConvertRecord {
+
+    //Apparently pretty printing is not portable as these tests fail on windows
+    @BeforeClass
+    public static void setUpSuite() {
+        Assume.assumeTrue("Test only runs on *nix", !SystemUtils.IS_OS_WINDOWS);
+    }
 
     @Test
     public void testSuccessfulConversion() throws InitializationException {
@@ -115,7 +128,7 @@ public class TestConvertRecord {
     }
 
     @Test
-    public void testReadFailure() throws InitializationException {
+    public void testReadFailure() throws InitializationException, IOException {
         final MockRecordParser readerService = new MockRecordParser(2);
         final MockRecordWriter writerService = new MockRecordWriter("header", false);
 
@@ -141,12 +154,13 @@ public class TestConvertRecord {
         // Original FlowFile should be routed to 'failure' relationship without modification
         runner.assertAllFlowFilesTransferred(ConvertRecord.REL_FAILURE, 1);
         final MockFlowFile out = runner.getFlowFilesForRelationship(ConvertRecord.REL_FAILURE).get(0);
-        assertTrue(original == out);
+        out.assertContentEquals(original.toByteArray());
+        out.assertAttributeEquals("record.error.message","Intentional Unit Test Exception because 2 records have been read");
     }
 
 
     @Test
-    public void testWriteFailure() throws InitializationException {
+    public void testWriteFailure() throws InitializationException, IOException {
         final MockRecordParser readerService = new MockRecordParser();
         final MockRecordWriter writerService = new MockRecordWriter("header", false, 2);
 
@@ -172,7 +186,8 @@ public class TestConvertRecord {
         // Original FlowFile should be routed to 'failure' relationship without modification
         runner.assertAllFlowFilesTransferred(ConvertRecord.REL_FAILURE, 1);
         final MockFlowFile out = runner.getFlowFilesForRelationship(ConvertRecord.REL_FAILURE).get(0);
-        assertTrue(original == out);
+        out.assertContentEquals(original.toByteArray());
+        out.assertAttributeEquals("record.error.message","Unit Test intentionally throwing IOException after 2 records were written");
     }
 
     @Test
@@ -203,9 +218,9 @@ public class TestConvertRecord {
         runner.setProperty(ConvertRecord.RECORD_WRITER, "writer");
 
         runner.run();
-        runner.assertAllFlowFilesTransferred(UpdateRecord.REL_SUCCESS, 1);
+        runner.assertAllFlowFilesTransferred(ConvertRecord.REL_SUCCESS, 1);
 
-        MockFlowFile flowFile = runner.getFlowFilesForRelationship(ExecuteSQL.REL_SUCCESS).get(0);
+        MockFlowFile flowFile = runner.getFlowFilesForRelationship(ConvertRecord.REL_SUCCESS).get(0);
         final ByteArrayOutputStream baos = new ByteArrayOutputStream();
 
         try (final SnappyInputStream sis = new SnappyInputStream(new ByteArrayInputStream(flowFile.toByteArray())); final OutputStream out = baos) {
@@ -217,5 +232,51 @@ public class TestConvertRecord {
         }
 
         assertEquals(new String(Files.readAllBytes(Paths.get("src/test/resources/TestConvertRecord/input/person.json"))), baos.toString(StandardCharsets.UTF_8.name()));
+    }
+
+    @Test
+    public void testCSVFormattingWithEL() throws InitializationException {
+        TestRunner runner = TestRunners.newTestRunner(ConvertRecord.class);
+
+        CSVReader csvReader = new CSVReader();
+        runner.addControllerService("csv-reader", csvReader);
+        runner.setProperty(csvReader, CSVUtils.VALUE_SEPARATOR, "${csv.in.delimiter}");
+        runner.setProperty(csvReader, CSVUtils.QUOTE_CHAR, "${csv.in.quote}");
+        runner.setProperty(csvReader, CSVUtils.ESCAPE_CHAR, "${csv.in.escape}");
+        runner.setProperty(csvReader, CSVUtils.COMMENT_MARKER, "${csv.in.comment}");
+        runner.enableControllerService(csvReader);
+
+        CSVRecordSetWriter csvWriter = new CSVRecordSetWriter();
+        runner.addControllerService("csv-writer", csvWriter);
+        runner.setProperty(csvWriter, CSVUtils.VALUE_SEPARATOR, "${csv.out.delimiter}");
+        runner.setProperty(csvWriter, CSVUtils.QUOTE_CHAR, "${csv.out.quote}");
+        runner.setProperty(csvWriter, CSVUtils.QUOTE_MODE, CSVUtils.QUOTE_ALL);
+        runner.enableControllerService(csvWriter);
+
+        runner.setProperty(ConvertRecord.RECORD_READER, "csv-reader");
+        runner.setProperty(ConvertRecord.RECORD_WRITER, "csv-writer");
+
+        String ffContent = "~ comment\n" +
+                "id|username|password\n" +
+                "123|'John'|^|^'^^\n";
+
+        Map<String, String> ffAttributes = new HashMap<>();
+        ffAttributes.put("csv.in.delimiter", "|");
+        ffAttributes.put("csv.in.quote", "'");
+        ffAttributes.put("csv.in.escape", "^");
+        ffAttributes.put("csv.in.comment", "~");
+        ffAttributes.put("csv.out.delimiter", "\t");
+        ffAttributes.put("csv.out.quote", "`");
+
+        runner.enqueue(ffContent, ffAttributes);
+        runner.run();
+
+        runner.assertAllFlowFilesTransferred(ConvertRecord.REL_SUCCESS, 1);
+
+        MockFlowFile flowFile = runner.getFlowFilesForRelationship(ConvertRecord.REL_SUCCESS).get(0);
+
+        String expected = "`id`\t`username`\t`password`\n" +
+                "`123`\t`John`\t`|'^`\n";
+        assertEquals(expected, new String(flowFile.toByteArray()));
     }
 }

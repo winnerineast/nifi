@@ -124,18 +124,18 @@ public class RecordBin {
 
             logger.debug("Migrating id={} to {}", new Object[] {flowFile.getId(), this});
 
+            if (recordWriter == null) {
+                final OutputStream rawOut = session.write(merged);
+                logger.debug("Created OutputStream using session {} for {}", new Object[] {session, this});
+
+                this.out = new ByteCountingOutputStream(rawOut);
+
+                recordWriter = writerFactory.createWriter(logger, recordReader.getSchema(), out, flowFile);
+                recordWriter.beginRecordSet();
+            }
+
             Record record;
             while ((record = recordReader.nextRecord()) != null) {
-                if (recordWriter == null) {
-                    final OutputStream rawOut = session.write(merged);
-                    logger.debug("Created OutputStream using session {} for {}", new Object[] {session, this});
-
-                    this.out = new ByteCountingOutputStream(rawOut);
-
-                    recordWriter = writerFactory.createWriter(logger, record.getSchema(), out);
-                    recordWriter.beginRecordSet();
-                }
-
                 recordWriter.write(record);
                 recordCount++;
             }
@@ -147,6 +147,8 @@ public class RecordBin {
             flowFileSession.migrate(this.session, Collections.singleton(flowFile));
             flowFileMigrated = true;
             this.flowFiles.add(flowFile);
+
+            thresholds.getFragmentCountAttribute().ifPresent(this::validateFragmentCount);
 
             if (recordCount >= getMinimumRecordCount()) {
                 // If we have met our minimum record count, we need to flush so that when we reach the desired number of bytes
@@ -213,22 +215,6 @@ public class RecordBin {
                 return true;
             }
 
-            Optional<String> fragmentCountAttribute = thresholds.getFragmentCountAttribute();
-            if(fragmentCountAttribute != null && fragmentCountAttribute.isPresent()) {
-                final Optional<String> fragmentCountValue = flowFiles.stream()
-                        .filter(ff -> ff.getAttribute(fragmentCountAttribute.get()) != null)
-                        .map(ff -> ff.getAttribute(fragmentCountAttribute.get()))
-                        .findFirst();
-                if (fragmentCountValue.isPresent()) {
-                    try {
-                        int expectedFragments = Integer.parseInt(fragmentCountValue.get());
-                        if (this.fragmentCount == expectedFragments)
-                            return true;
-                    } catch (NumberFormatException nfe) {
-                        this.logger.error(nfe.getMessage(), nfe);
-                    }
-                }
-            }
             return false;
         } finally {
             readLock.unlock();
@@ -252,6 +238,11 @@ public class RecordBin {
         try {
             if (flowFiles.isEmpty()) {
                 return false;
+            }
+
+            if (thresholds.getFragmentCountAttribute().isPresent()) {
+                // Compare with the target fragment count.
+                return this.fragmentCount == thresholds.getFragmentCount();
             }
 
             final int requiredRecordCount = getMinimumRecordCount();
@@ -313,6 +304,48 @@ public class RecordBin {
         }
     }
 
+    /**
+     * Ensure that at least one FlowFile has a fragment.count attribute and that they all have the same value, if they have a value.
+     */
+    private void validateFragmentCount(String countAttributeName) {
+        Integer expectedFragmentCount = thresholds.getFragmentCount();
+        for (final FlowFile flowFile : flowFiles) {
+            final String countVal = flowFile.getAttribute(countAttributeName);
+            if (countVal == null) {
+                continue;
+            }
+
+            final int count;
+            try {
+                count = Integer.parseInt(countVal);
+            } catch (final NumberFormatException nfe) {
+                logger.error("Could not merge bin with {} FlowFiles because the '{}' attribute had a value of '{}' for {} but expected a number",
+                    new Object[] {flowFiles.size(), countAttributeName, countVal, flowFile});
+                fail();
+                return;
+            }
+
+            if (expectedFragmentCount != null && count != expectedFragmentCount) {
+                logger.error("Could not merge bin with {} FlowFiles because the '{}' attribute had a value of '{}' for {} but another FlowFile in the bin had a value of {}",
+                    new Object[] {flowFiles.size(), countAttributeName, countVal, flowFile, expectedFragmentCount});
+                fail();
+                return;
+            }
+
+            if (expectedFragmentCount == null) {
+                expectedFragmentCount = count;
+                thresholds.setFragmentCount(count);
+            }
+        }
+
+        if (expectedFragmentCount == null) {
+            logger.error("Could not merge bin with {} FlowFiles because the '{}' attribute was not present on any of the FlowFiles",
+                new Object[] {flowFiles.size(), countAttributeName});
+            fail();
+            return;
+        }
+    }
+
     public void complete(final String completionReason) throws IOException {
         writeLock.lock();
         try {
@@ -333,48 +366,16 @@ public class RecordBin {
                 return;
             }
 
-            // If using defragment mode, and we don't have enough FlowFiles, then we need to fail this bin.
             final Optional<String> countAttr = thresholds.getFragmentCountAttribute();
             if (countAttr.isPresent()) {
-                // Ensure that at least one FlowFile has a fragment.count attribute and that they all have the same value, if they have a value.
-                Integer expectedBinCount = null;
-                for (final FlowFile flowFile : flowFiles) {
-                    final String countVal = flowFile.getAttribute(countAttr.get());
-                    if (countVal == null) {
-                        continue;
-                    }
+                validateFragmentCount(countAttr.get());
 
-                    final int count;
-                    try {
-                        count = Integer.parseInt(countVal);
-                    } catch (final NumberFormatException nfe) {
-                        logger.error("Could not merge bin with {} FlowFiles because the '{}' attribute had a value of '{}' for {} but expected a number",
-                            new Object[] {flowFiles.size(), countAttr.get(), countVal, flowFile});
-                        fail();
-                        return;
-                    }
-
-                    if (expectedBinCount != null && count != expectedBinCount) {
-                        logger.error("Could not merge bin with {} FlowFiles because the '{}' attribute had a value of '{}' for {} but another FlowFile in the bin had a value of {}",
-                            new Object[] {flowFiles.size(), countAttr.get(), countVal, flowFile, expectedBinCount});
-                        fail();
-                        return;
-                    }
-
-                    expectedBinCount = count;
-                }
-
-                if (expectedBinCount == null) {
-                    logger.error("Could not merge bin with {} FlowFiles because the '{}' attribute was not present on any of the FlowFiles",
-                        new Object[] {flowFiles.size(), countAttr.get()});
-                    fail();
-                    return;
-                }
-
-                if (expectedBinCount != flowFiles.size()) {
+                // If using defragment mode, and we don't have enough FlowFiles, then we need to fail this bin.
+                Integer expectedFragmentCount = thresholds.getFragmentCount();
+                if (expectedFragmentCount != flowFiles.size()) {
                     logger.error("Could not merge bin with {} FlowFiles because the '{}' attribute had a value of '{}' but only {} of {} FlowFiles were encountered before this bin was evicted "
-                        + "(due to to Max Bin Age being reached or due to the Maximum Number of Bins being exceeded).",
-                        new Object[] {flowFiles.size(), countAttr.get(), expectedBinCount, flowFiles.size(), expectedBinCount});
+                                    + "(due to to Max Bin Age being reached or due to the Maximum Number of Bins being exceeded).",
+                            new Object[] {flowFiles.size(), countAttr.get(), expectedFragmentCount, flowFiles.size(), expectedFragmentCount});
                     fail();
                     return;
                 }

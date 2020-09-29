@@ -266,7 +266,6 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
         descriptors.add(ID_RECORD_PATH);
         descriptors.add(INDEX);
         descriptors.add(TYPE);
-        descriptors.add(CHARSET);
         descriptors.add(INDEX_OP);
         descriptors.add(SUPPRESS_NULLS);
         descriptors.add(DATE_FORMAT);
@@ -559,8 +558,8 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
 
                 final RecordSchema schema = writerFactory.getSchema(inputFlowFile.getAttributes(), reader.getSchema());
 
-                try (final RecordSetWriter successWriter = writerFactory.createWriter(getLogger(), schema, successOut);
-                     final RecordSetWriter failedWriter = writerFactory.createWriter(getLogger(), schema, failedOut)) {
+                try (final RecordSetWriter successWriter = writerFactory.createWriter(getLogger(), schema, successOut, successFlowFile);
+                     final RecordSetWriter failedWriter = writerFactory.createWriter(getLogger(), schema, failedOut, failedFlowFile)) {
 
                     successWriter.beginRecordSet();
                     failedWriter.beginRecordSet();
@@ -577,17 +576,6 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
                         i++;
                     }
                 }
-
-                session.putAttribute(successFlowFile, "record.count", Integer.toString(recordCount - failures.size()));
-
-                // Normal behavior is to output with record.count. In order to not break backwards compatibility, set both here.
-                session.putAttribute(failedFlowFile, "record.count", Integer.toString(failures.size()));
-                session.putAttribute(failedFlowFile, "failure.count", Integer.toString(failures.size()));
-
-                session.transfer(successFlowFile, REL_SUCCESS);
-                session.transfer(failedFlowFile, REL_FAILURE);
-                session.remove(inputFlowFile);
-
             } catch (final IOException | SchemaNotFoundException | MalformedRecordException e) {
                 // We failed while handling individual failures. Not much else we can do other than log, and route the whole thing to failure.
                 getLogger().error("Failed to process {} during individual record failure handling; route whole FF to failure", new Object[] {flowFile, e});
@@ -598,7 +586,16 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
                 if (failedFlowFile != null) {
                     session.remove(failedFlowFile);
                 }
+                return;
             }
+            session.putAttribute(successFlowFile, "record.count", Integer.toString(recordCount - failures.size()));
+
+            // Normal behavior is to output with record.count. In order to not break backwards compatibility, set both here.
+            session.putAttribute(failedFlowFile, "record.count", Integer.toString(failures.size()));
+            session.putAttribute(failedFlowFile, "failure.count", Integer.toString(failures.size()));
+            session.transfer(successFlowFile, REL_SUCCESS);
+            session.transfer(failedFlowFile, REL_FAILURE);
+            session.remove(inputFlowFile);
         }
     }
 
@@ -696,6 +693,9 @@ public class PutElasticsearchHttpRecord extends AbstractElasticsearchHttpProcess
                 } else {
                     generator.writeNumber((BigInteger) coercedValue);
                 }
+                break;
+            case DECIMAL:
+                generator.writeNumber(DataTypeUtils.toBigDecimal(coercedValue, fieldName));
                 break;
             case BOOLEAN:
                 final String stringValue = coercedValue.toString();

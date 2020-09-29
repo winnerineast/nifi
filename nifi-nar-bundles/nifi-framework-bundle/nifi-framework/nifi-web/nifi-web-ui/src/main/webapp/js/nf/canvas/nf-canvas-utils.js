@@ -349,11 +349,8 @@
                 var refreshGraph = $.Deferred(function (deferred) {
                     // load a different group if necessary
                     if (groupId !== nfCanvas.getGroupId()) {
-                        // set the new group id
-                        nfCanvas.setGroupId(groupId);
-
-                        // reload
-                        nfCanvas.reload().done(function () {
+                        // load the process group
+                        nfCanvas.reload({}, groupId).done(function () {
                             deferred.resolve();
                         }).fail(function (xhr, status, error) {
                             nfDialog.showOkDialog({
@@ -455,11 +452,8 @@
                 var refreshGraph = $.Deferred(function (deferred) {
                     // load a different group if necessary
                     if (groupId !== nfCanvas.getGroupId() || forceCanvasLoad) {
-                        // set the new group id
-                        nfCanvas.setGroupId(groupId);
-
-                        // reload
-                        nfCanvas.reload().done(function () {
+                        // load the process group
+                        nfCanvas.reload({}, groupId).done(function () {
                             deferred.resolve();
                         }).fail(function (xhr, status, error) {
                             nfDialog.showOkDialog({
@@ -572,6 +566,16 @@
          */
         getSelection: function () {
             return d3.selectAll('g.component.selected, g.connection.selected');
+        },
+
+        /**
+         * Gets the selection object of the id passed.
+         *
+         * @param {id}              The uuid of the component to retrieve
+         * @returns {selection}     The selection object of the component id passed
+         */
+        getSelectionById: function(id){
+            return d3.select('#id-' + id);
         },
 
         /**
@@ -2085,6 +2089,22 @@
         },
 
         /**
+         * Set the parameter context.
+         *
+         * @argument {string} pc       The parameter context
+         */
+        setParameterContext: function (pc) {
+            return nfCanvas.setParameterContext(pc);
+        },
+
+        /**
+         * Get the parameter context.
+         */
+        getParameterContext: function () {
+            return nfCanvas.getParameterContext();
+        },
+
+        /**
          * Get the group name.
          */
         getGroupName: function () {
@@ -2100,11 +2120,13 @@
 
         /**
          * Reloads the status for the entire canvas (components and flow.)
+         *
+         * @param {string} groupId    Optional, specific group id to reload the canvas to
          */
-        reload: function () {
+        reload: function (groupId) {
             return nfCanvas.reload({
                 'transition': true
-            });
+            }, groupId);
         },
 
         /**

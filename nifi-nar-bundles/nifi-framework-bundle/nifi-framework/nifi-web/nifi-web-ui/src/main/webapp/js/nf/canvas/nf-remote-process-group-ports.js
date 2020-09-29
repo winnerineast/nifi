@@ -146,38 +146,16 @@
                                 $('#' + remotePortId + '-batch-size').text(batchSettings.size);
                                 $('#' + remotePortId + '-batch-duration').text(batchSettings.duration);
 
-                            }).fail(function (xhr, status, error) {
-                                if (xhr.status === 400) {
-                                    var errors = xhr.responseText.split('\n');
-
-                                    var content;
-                                    if (errors.length === 1) {
-                                        content = $('<span></span>').text(errors[0]);
-                                    } else {
-                                        content = nfCommon.formatUnorderedList(errors);
-                                    }
-
-                                    nfDialog.showOkDialog({
-                                        dialogContent: content,
-                                        headerText: 'Remote Process Group Ports'
-                                    });
-                                } else {
-                                    nfErrorHandler.handleAjaxError(xhr, status, error);
-                                }
-                            }).always(function () {
                                 // close the dialog
                                 $('#remote-port-configuration').modal('hide');
-                            });
+                            }).fail(nfErrorHandler.handleConfigurationUpdateAjaxError);
                         } else {
                             nfDialog.showOkDialog({
-                                headerText: 'Remote Process Group Ports',
+                                headerText: 'Configuration Error',
                                 dialogContent: portValidationErrors.reduce(function (prev, curr) {
                                     return typeof(prev) === 'string' ? prev + ' ' + curr : curr;
                                 })
                             });
-
-                            // close the dialog
-                            $('#remote-port-configuration').modal('hide');
                         }
                     }
                 }
@@ -353,7 +331,7 @@
                         editRemotePort.show();
                     }
                 } else if (port.exists === false) {
-                    $('<div class="remote-port-removed"/>').appendTo(portContainerEditContainer).qtip($.extend({},
+                    $('<div class="remote-port-removed" />').appendTo(portContainerEditContainer).qtip($.extend({},
                         nfCommon.config.tooltipConfig,
                         {
                             content: 'This port has been removed.'
@@ -440,23 +418,8 @@
                         transmissionSwitch.replaceWith(newTransmissionSwitch);
                         // update transmissionSwitch variable to reference the new switch
                         transmissionSwitch = newTransmissionSwitch;
-                        if (xhr.status === 400) {
-                            var errors = xhr.responseText.split('\n');
 
-                            var content;
-                            if (errors.length === 1) {
-                                content = $('<span></span>').text(errors[0]);
-                            } else {
-                                content = nfCommon.formatUnorderedList(errors);
-                            }
-
-                            nfDialog.showOkDialog({
-                                headerText: 'Remote Process Group Ports',
-                                dialogContent: content
-                            });
-                        } else {
-                            nfErrorHandler.handleAjaxError(xhr, status, error);
-                        }
+                        nfErrorHandler.handleConfigurationUpdateAjaxError(xhr, status, error);
                     });
                 };
 

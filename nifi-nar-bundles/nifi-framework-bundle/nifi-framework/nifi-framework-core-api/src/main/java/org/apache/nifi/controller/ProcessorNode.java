@@ -40,6 +40,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 public abstract class ProcessorNode extends AbstractComponentNode implements Connectable {
 
@@ -72,12 +73,12 @@ public abstract class ProcessorNode extends AbstractComponentNode implements Con
 
     public abstract Requirement getInputRequirement();
 
-    public abstract List<ActiveThreadInfo> getActiveThreads();
+    public abstract List<ActiveThreadInfo> getActiveThreads(ThreadDetails threadDetails);
 
     /**
      * Returns the number of threads that are still 'active' in this Processor but have been terminated
      * via {@link #terminate()}. To understand more about these threads, such as their stack traces and
-     * how long they have been active, one can use {@link #getActiveThreads()} and then filter the results
+     * how long they have been active, one can use {@link #getActiveThreads(ThreadDetails)} and then filter the results
      * to include only those {@link ActiveThreadInfo} objects for which the thread is terminated. For example:
      * {@code getActiveThreads().stream().filter(ActiveThreadInfo::isTerminated).collect(Collectors.toList());}
      *
@@ -185,8 +186,8 @@ public abstract class ProcessorNode extends AbstractComponentNode implements Con
      *            the amount of milliseconds to wait for administrative yield
      * @param timeoutMillis the number of milliseconds to wait after triggering the Processor's @OnScheduled methods before timing out and considering
      * the startup a failure. This will result in the thread being interrupted and trying again.
-     * @param processContext
-     *            the instance of {@link ProcessContext}
+     * @param processContextFactory
+     *            a factory for creating instances of {@link ProcessContext}
      * @param schedulingAgentCallback
      *            the callback provided by the {@link ProcessScheduler} to
      *            execute upon successful start of the Processor
@@ -195,7 +196,7 @@ public abstract class ProcessorNode extends AbstractComponentNode implements Con
      *            value is <code>true</code> or if the Processor is in any state other than 'STOPPING' or 'RUNNING', then this method
      *            will throw an {@link IllegalStateException}.
      */
-    public abstract void start(ScheduledExecutorService scheduler, long administrativeYieldMillis, long timeoutMillis, ProcessContext processContext,
+    public abstract void start(ScheduledExecutorService scheduler, long administrativeYieldMillis, long timeoutMillis, Supplier<ProcessContext> processContextFactory,
                                SchedulingAgentCallback schedulingAgentCallback, boolean failIfStopping);
 
     /**

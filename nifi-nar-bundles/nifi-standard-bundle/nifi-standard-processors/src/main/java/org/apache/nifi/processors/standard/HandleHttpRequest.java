@@ -25,7 +25,9 @@ import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
-import org.apache.nifi.annotation.lifecycle.OnStopped;
+import org.apache.nifi.annotation.lifecycle.OnUnscheduled;
+import org.apache.nifi.annotation.notification.OnPrimaryNodeStateChange;
+import org.apache.nifi.annotation.notification.PrimaryNodeState;
 import org.apache.nifi.components.AllowableValue;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.expression.ExpressionLanguageScope;
@@ -39,6 +41,7 @@ import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.processors.standard.util.HTTPUtils;
+import org.apache.nifi.scheduling.ExecutionNode;
 import org.apache.nifi.ssl.RestrictedSSLContextService;
 import org.apache.nifi.ssl.SSLContextService;
 import org.apache.nifi.stream.io.StreamUtils;
@@ -65,7 +68,6 @@ import javax.servlet.http.Cookie;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import javax.servlet.http.Part;
-import javax.ws.rs.core.Response.Status;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
@@ -110,6 +112,8 @@ import java.util.regex.Pattern;
     @WritesAttribute(attribute = HTTPUtils.HTTP_REQUEST_URI, description = "The full Request URL"),
     @WritesAttribute(attribute = "http.auth.type", description = "The type of HTTP Authorization used"),
     @WritesAttribute(attribute = "http.principal.name", description = "The name of the authenticated user making the request"),
+    @WritesAttribute(attribute = "http.query.param.XXX", description = "Each of query parameters in the request will be added as an attribute, "
+            + "prefixed with \"http.query.param.\""),
     @WritesAttribute(attribute = HTTPUtils.HTTP_SSL_CERT, description = "The Distinguished Name of the requestor. This value will not be populated "
             + "unless the Processor is configured to use an SSLContext Service"),
     @WritesAttribute(attribute = "http.issuer.dn", description = "The Distinguished Name of the entity that issued the Subject's certificate. "
@@ -302,8 +306,10 @@ public class HandleHttpRequest extends AbstractProcessor {
     }
 
     private volatile Server server;
+    private volatile boolean ready;
     private AtomicBoolean initialized = new AtomicBoolean(false);
     private volatile BlockingQueue<HttpRequestContainer> containerQueue;
+    private AtomicBoolean runOnPrimary = new AtomicBoolean(false);
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
@@ -320,10 +326,11 @@ public class HandleHttpRequest extends AbstractProcessor {
         initialized.set(false);
     }
 
-    private synchronized void initializeServer(final ProcessContext context) throws Exception {
+    synchronized void initializeServer(final ProcessContext context) throws Exception {
         if(initialized.get()){
             return;
         }
+        runOnPrimary.set(context.getExecutionNode().equals(ExecutionNode.PRIMARY));
         this.containerQueue = new LinkedBlockingQueue<>(context.getProperty(CONTAINER_QUEUE_SIZE).asInteger());
         final String host = context.getProperty(HOSTNAME).getValue();
         final int port = context.getProperty(PORT).evaluateAttributeExpressions().asInteger();
@@ -430,7 +437,7 @@ public class HandleHttpRequest extends AbstractProcessor {
                 if (!allowedMethods.contains(request.getMethod().toUpperCase())) {
                     getLogger().info("Sending back METHOD_NOT_ALLOWED response to {}; method was {}; request URI was {}",
                             new Object[]{request.getRemoteAddr(), request.getMethod(), requestUri});
-                    response.sendError(Status.METHOD_NOT_ALLOWED.getStatusCode());
+                    response.sendError(HttpServletResponse.SC_METHOD_NOT_ALLOWED);
                     return;
                 }
 
@@ -443,34 +450,45 @@ public class HandleHttpRequest extends AbstractProcessor {
                     }
 
                     if (!pathPattern.matcher(uri.getPath()).matches()) {
-                        response.sendError(Status.NOT_FOUND.getStatusCode());
                         getLogger().info("Sending back NOT_FOUND response to {}; request was {} {}",
                                 new Object[]{request.getRemoteAddr(), request.getMethod(), requestUri});
+                        response.sendError(HttpServletResponse.SC_NOT_FOUND);
                         return;
                     }
                 }
 
                 // If destination queues full, send back a 503: Service Unavailable.
                 if (context.getAvailableRelationships().isEmpty()) {
-                    response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE);
+                    getLogger().warn("Request from {} cannot be processed, processor downstream queue is full; responding with SERVICE_UNAVAILABLE",
+                            new Object[]{request.getRemoteAddr()});
+
+                    response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE, "Processor queue is full");
+                    return;
+                } else if (!ready) {
+                    getLogger().warn("Request from {} cannot be processed, processor is being shut down; responding with SERVICE_UNAVAILABLE",
+                        new Object[]{request.getRemoteAddr()});
+
+                    response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE, "Processor is shutting down");
                     return;
                 }
 
                 // Right now, that information, though, is only in the ProcessSession, not the ProcessContext,
                 // so it is not known to us. Should see if it can be added to the ProcessContext.
                 final AsyncContext async = baseRequest.startAsync();
-                async.setTimeout(requestTimeout);
+
+                // disable timeout handling on AsyncContext, timeout will be handled in HttpContextMap
+                async.setTimeout(0);
+
                 final boolean added = containerQueue.offer(new HttpRequestContainer(request, response, async));
 
                 if (added) {
                     getLogger().debug("Added Http Request to queue for {} {} from {}",
                             new Object[]{request.getMethod(), requestUri, request.getRemoteAddr()});
                 } else {
-                    getLogger().info("Sending back a SERVICE_UNAVAILABLE response to {}; request was {} {}",
-                            new Object[]{request.getRemoteAddr(), request.getMethod(), request.getRemoteAddr()});
+                    getLogger().warn("Request from {} cannot be processed, container queue is full; responding with SERVICE_UNAVAILABLE",
+                            new Object[]{request.getRemoteAddr()});
 
-                    response.sendError(Status.SERVICE_UNAVAILABLE.getStatusCode());
-                    response.flushBuffer();
+                    response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE, "Container queue is full");
                     async.complete();
                 }
             }
@@ -482,6 +500,7 @@ public class HandleHttpRequest extends AbstractProcessor {
         getLogger().info("Server started and listening on port " + getPort());
 
         initialized.set(true);
+        ready = true;
     }
 
     protected int getPort() {
@@ -506,6 +525,11 @@ public class HandleHttpRequest extends AbstractProcessor {
 
         sslFactory.setProtocol(sslService.getSslAlgorithm());
 
+        // Need to set SslContextFactory's endpointIdentificationAlgorithm to null; this is a server,
+        // not a client.  Server does not need to perform hostname verification on the client.
+        // Previous to Jetty 9.4.15.v20190215, this defaulted to null.
+        sslFactory.setEndpointIdentificationAlgorithm(null);
+
         if (sslService.isKeyStoreConfigured()) {
             sslFactory.setKeyStorePath(sslService.getKeyStoreFile());
             sslFactory.setKeyStorePassword(sslService.getKeyStorePassword());
@@ -521,14 +545,59 @@ public class HandleHttpRequest extends AbstractProcessor {
         return sslFactory;
     }
 
-    @OnStopped
+    @OnUnscheduled
     public void shutdown() throws Exception {
+        ready = false;
+
         if (server != null) {
             getLogger().debug("Shutting down server");
+            rejectPendingRequests();
             server.stop();
             server.destroy();
             server.join();
+            clearInit();
             getLogger().info("Shut down {}", new Object[]{server});
+        }
+    }
+
+    void rejectPendingRequests() {
+        HttpRequestContainer container;
+        while ((container = getNextContainer()) != null) {
+            try {
+                getLogger().warn("Rejecting request from {} during cleanup after processor shutdown; responding with SERVICE_UNAVAILABLE",
+                    new Object[]{container.getRequest().getRemoteAddr()});
+
+                HttpServletResponse response = container.getResponse();
+                response.sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE, "Processor is shutting down");
+                container.getContext().complete();
+            } catch (final IOException e) {
+                getLogger().warn("Failed to send HTTP response to {} due to {}",
+                    new Object[]{container.getRequest().getRemoteAddr(), e});
+            }
+        }
+    }
+
+    private HttpRequestContainer getNextContainer() {
+        HttpRequestContainer container;
+        try {
+            container = containerQueue.poll(2, TimeUnit.SECONDS);
+        } catch (final InterruptedException e) {
+            getLogger().warn("Interrupted while polling for " + HttpRequestContainer.class.getSimpleName() + " during cleanup.");
+            container = null;
+        }
+
+        return container;
+    }
+
+    @OnPrimaryNodeStateChange
+    public void onPrimaryNodeChange(final PrimaryNodeState newState) {
+        if (runOnPrimary.get() && newState.equals(PrimaryNodeState.PRIMARY_NODE_REVOKED)) {
+            try {
+                shutdown();
+            } catch (final Exception shutdownException) {
+                getLogger().warn("Processor is configured to run only on Primary Node, but failed to shutdown HTTP server following revocation of primary node status due to {}",
+                        shutdownException);
+            }
         }
     }
 
@@ -570,9 +639,10 @@ public class HandleHttpRequest extends AbstractProcessor {
           final long requestMaxSize = context.getProperty(MULTIPART_REQUEST_MAX_SIZE).asDataSize(DataUnit.B).longValue();
           final int readBufferSize = context.getProperty(MULTIPART_READ_BUFFER_SIZE).asDataSize(DataUnit.B).intValue();
           String tempDir = System.getProperty("java.io.tmpdir");
-          request.setAttribute(Request.__MULTIPART_CONFIG_ELEMENT, new MultipartConfigElement(tempDir, requestMaxSize, requestMaxSize, readBufferSize));
+          request.setAttribute(Request.MULTIPART_CONFIG_ELEMENT, new MultipartConfigElement(tempDir, requestMaxSize, requestMaxSize, readBufferSize));
+          List<Part> parts = null;
           try {
-            List<Part> parts = ImmutableList.copyOf(request.getParts());
+            parts = ImmutableList.copyOf(request.getParts());
             int allPartsCount = parts.size();
             final String contextIdentifier = UUID.randomUUID().toString();
             for (int i = 0; i < allPartsCount; i++) {
@@ -597,6 +667,16 @@ public class HandleHttpRequest extends AbstractProcessor {
           } catch (IOException | ServletException | IllegalStateException e) {
             handleFlowContentStreamingError(session, container, request, Optional.absent(), e);
             return;
+          } finally {
+            if (parts != null) {
+              for (Part part : parts) {
+                try {
+                  part.delete();
+                } catch (Exception e) {
+                  getLogger().error("Couldn't delete underlying storage for {}", new Object[]{part}, e);
+                }
+              }
+            }
           }
         } else {
           FlowFile flowFile = session.create();
@@ -662,13 +742,6 @@ public class HandleHttpRequest extends AbstractProcessor {
           putAttribute(attributes, "http.locale", request.getLocale());
           putAttribute(attributes, "http.server.name", request.getServerName());
           putAttribute(attributes, HTTPUtils.HTTP_PORT, request.getServerPort());
-
-          final Enumeration<String> paramEnumeration = request.getParameterNames();
-          while (paramEnumeration.hasMoreElements()) {
-              final String paramName = paramEnumeration.nextElement();
-              final String value = request.getParameter(paramName);
-              attributes.put("http.param." + paramName, value);
-          }
 
           final Cookie[] cookies = request.getCookies();
           if (cookies != null) {
@@ -760,8 +833,7 @@ public class HandleHttpRequest extends AbstractProcessor {
             new Object[]{request.getRemoteAddr()});
 
         try {
-          container.getResponse().setStatus(Status.SERVICE_UNAVAILABLE.getStatusCode());
-          container.getResponse().flushBuffer();
+          container.getResponse().sendError(HttpServletResponse.SC_SERVICE_UNAVAILABLE, "HttpContextMap is full");
           container.getContext().complete();
         } catch (final Exception e) {
           getLogger().warn("Failed to respond with SERVICE_UNAVAILABLE message to {} due to {}",
@@ -786,8 +858,7 @@ public class HandleHttpRequest extends AbstractProcessor {
 
       try {
           HttpServletResponse response = container.getResponse();
-          response.sendError(Status.BAD_REQUEST.getStatusCode());
-          response.flushBuffer();
+          response.sendError(HttpServletResponse.SC_BAD_REQUEST);
           container.getContext().complete();
       } catch (final IOException ioe) {
           getLogger().warn("Failed to send HTTP response to {} due to {}",

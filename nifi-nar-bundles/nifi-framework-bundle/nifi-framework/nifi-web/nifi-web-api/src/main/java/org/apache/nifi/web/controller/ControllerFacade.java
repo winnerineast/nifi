@@ -56,6 +56,8 @@ import org.apache.nifi.controller.status.PortStatus;
 import org.apache.nifi.controller.status.ProcessGroupStatus;
 import org.apache.nifi.controller.status.ProcessorStatus;
 import org.apache.nifi.controller.status.RemoteProcessGroupStatus;
+import org.apache.nifi.controller.status.analytics.StatusAnalytics;
+import org.apache.nifi.controller.status.analytics.StatusAnalyticsEngine;
 import org.apache.nifi.controller.status.history.ComponentStatusRepository;
 import org.apache.nifi.diagnostics.SystemDiagnostics;
 import org.apache.nifi.flowfile.FlowFilePrioritizer;
@@ -76,10 +78,9 @@ import org.apache.nifi.provenance.search.QuerySubmission;
 import org.apache.nifi.provenance.search.SearchTerm;
 import org.apache.nifi.provenance.search.SearchTerms;
 import org.apache.nifi.provenance.search.SearchableField;
-import org.apache.nifi.registry.VariableRegistry;
 import org.apache.nifi.registry.flow.VersionedProcessGroup;
+import org.apache.nifi.remote.PublicPort;
 import org.apache.nifi.remote.RemoteGroupPort;
-import org.apache.nifi.remote.RootGroupPort;
 import org.apache.nifi.reporting.BulletinRepository;
 import org.apache.nifi.reporting.ReportingTask;
 import org.apache.nifi.services.FlowService;
@@ -107,6 +108,8 @@ import org.apache.nifi.web.api.dto.search.SearchResultsDTO;
 import org.apache.nifi.web.api.dto.status.ControllerStatusDTO;
 import org.apache.nifi.web.api.dto.status.StatusHistoryDTO;
 import org.apache.nifi.web.api.entity.ControllerServiceEntity;
+import org.apache.nifi.web.search.query.SearchQuery;
+import org.apache.nifi.web.search.query.SearchQueryParser;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -145,7 +148,7 @@ public class ControllerFacade implements Authorizable {
     // properties
     private NiFiProperties properties;
     private DtoFactory dtoFactory;
-    private VariableRegistry variableRegistry;
+    private SearchQueryParser searchQueryParser;
     private ControllerSearchService controllerSearchService;
 
     private ProcessGroup getRootGroup() {
@@ -178,6 +181,10 @@ public class ControllerFacade implements Authorizable {
 
     public ExtensionManager getExtensionManager() {
         return flowController.getExtensionManager();
+    }
+
+    public FlowManager getFlowManager() {
+        return flowController.getFlowManager();
     }
 
     /**
@@ -256,35 +263,19 @@ public class ControllerFacade implements Authorizable {
     }
 
     /**
-     * Gets the input ports on the root group.
-     *
+     * Gets the remotely accessible InputPorts in any ProcessGroup.
      * @return input ports
      */
-    public Set<RootGroupPort> getInputPorts() {
-        final Set<RootGroupPort> inputPorts = new HashSet<>();
-        ProcessGroup rootGroup = getRootGroup();
-        for (final Port port : rootGroup.getInputPorts()) {
-            if (port instanceof RootGroupPort) {
-                inputPorts.add((RootGroupPort) port);
-            }
-        }
-        return inputPorts;
+    public Set<Port> getPublicInputPorts() {
+        return flowController.getFlowManager().getPublicInputPorts();
     }
 
     /**
-     * Gets the output ports on the root group.
-     *
+     * Gets the remotely accessible OutputPorts in any ProcessGroup.
      * @return output ports
      */
-    public Set<RootGroupPort> getOutputPorts() {
-        final Set<RootGroupPort> outputPorts = new HashSet<>();
-        ProcessGroup rootGroup = getRootGroup();
-        for (final Port port : rootGroup.getOutputPorts()) {
-            if (port instanceof RootGroupPort) {
-                outputPorts.add((RootGroupPort) port);
-            }
-        }
-        return outputPorts;
+    public Set<Port> getPublicOutputPorts() {
+        return flowController.getFlowManager().getPublicOutputPorts();
     }
 
     /**
@@ -643,22 +634,7 @@ public class ControllerFacade implements Authorizable {
      * @return the status for the specified processor
      */
     public ProcessorStatus getProcessorStatus(final String processorId) {
-        final ProcessGroup root = getRootGroup();
-        final ProcessorNode processor = root.findProcessor(processorId);
-
-        // ensure the processor was found
-        if (processor == null) {
-            throw new ResourceNotFoundException(String.format("Unable to locate processor with id '%s'.", processorId));
-        }
-
-        // calculate the process group status
-        final String groupId = processor.getProcessGroup().getIdentifier();
-        final ProcessGroupStatus processGroupStatus = flowController.getEventAccess().getGroupStatus(groupId, NiFiUserUtils.getNiFiUser(), 1);
-        if (processGroupStatus == null) {
-            throw new ResourceNotFoundException(String.format("Unable to locate group with id '%s'.", groupId));
-        }
-
-        final ProcessorStatus status = processGroupStatus.getProcessorStatus().stream().filter(processorStatus -> processorId.equals(processorStatus.getId())).findFirst().orElse(null);
+        final ProcessorStatus status = flowController.getEventAccess().getProcessorStatus(processorId, NiFiUserUtils.getNiFiUser());
         if (status == null) {
             throw new ResourceNotFoundException(String.format("Unable to locate processor with id '%s'.", processorId));
         }
@@ -694,6 +670,37 @@ public class ControllerFacade implements Authorizable {
         }
 
         return status;
+    }
+
+    /**
+     * Gets status analytics for the specified connection.
+     *
+     * @param connectionId connection id
+     * @return the statistics for the specified connection
+     */
+    public StatusAnalytics getConnectionStatusAnalytics(final String connectionId) {
+        final ProcessGroup root = getRootGroup();
+        final Connection connection = root.findConnection(connectionId);
+
+        // ensure the connection was found
+        if (connection == null) {
+            throw new ResourceNotFoundException(String.format("Unable to locate connection with id '%s'.", connectionId));
+        }
+
+        // calculate the process group status
+        final String groupId = connection.getProcessGroup().getIdentifier();
+        final ProcessGroupStatus processGroupStatus = flowController.getEventAccess().getGroupStatus(groupId, NiFiUserUtils.getNiFiUser(), 1);
+        if (processGroupStatus == null) {
+            throw new ResourceNotFoundException(String.format("Unable to locate group with id '%s'.", groupId));
+        }
+
+        // get from flow controller
+        final StatusAnalyticsEngine statusAnalyticsEngine = flowController.getStatusAnalyticsEngine();
+        if (statusAnalyticsEngine == null) {
+            throw new ResourceNotFoundException(String.format("Unable to provide analytics for connection with id '%s'. Analytics may not be enabled", connectionId));
+        }
+
+        return statusAnalyticsEngine.getStatusAnalytics(connectionId);
     }
 
     /**
@@ -848,6 +855,10 @@ public class ControllerFacade implements Authorizable {
         resources.add(ResourceFactory.getProxyResource());
         resources.add(ResourceFactory.getResourceResource());
         resources.add(ResourceFactory.getSiteToSiteResource());
+        resources.add(ResourceFactory.getParameterContextsResource());
+
+        // add each parameter context
+        flowController.getFlowManager().getParameterContextManager().getParameterContexts().forEach(parameterContext -> resources.add(parameterContext.getResource()));
 
         // restricted components
         resources.add(ResourceFactory.getRestrictedComponentsResource());
@@ -907,7 +918,7 @@ public class ControllerFacade implements Authorizable {
             resources.add(ResourceFactory.getProvenanceDataResource(inputPortResource));
             resources.add(ResourceFactory.getPolicyResource(inputPortResource));
             resources.add(ResourceFactory.getOperationResource(inputPortResource));
-            if (inputPort instanceof RootGroupPort) {
+            if (inputPort instanceof PublicPort) {
                 resources.add(ResourceFactory.getDataTransferResource(inputPortResource));
             }
         }
@@ -920,7 +931,7 @@ public class ControllerFacade implements Authorizable {
             resources.add(ResourceFactory.getProvenanceDataResource(outputPortResource));
             resources.add(ResourceFactory.getPolicyResource(outputPortResource));
             resources.add(ResourceFactory.getOperationResource(outputPortResource));
-            if (outputPort instanceof RootGroupPort) {
+            if (outputPort instanceof PublicPort) {
                 resources.add(ResourceFactory.getDataTransferResource(outputPortResource));
             }
         }
@@ -1589,14 +1600,22 @@ public class ControllerFacade implements Authorizable {
     /**
      * Searches this controller for the specified term.
      *
-     * @param search search
+     * @param searchLiteral search string specified by the user
+     * @param activeGroupId the identifier of the currently visited group
      * @return result
      */
-    public SearchResultsDTO search(final String search) {
+    public SearchResultsDTO search(final String searchLiteral, final String activeGroupId) {
         final ProcessGroup rootGroup = getRootGroup();
+        final ProcessGroup activeGroup = (activeGroupId == null)
+                ? rootGroup
+                : flowController.getFlowManager().getGroup(activeGroupId);
         final SearchResultsDTO results = new SearchResultsDTO();
+        final SearchQuery searchQuery = searchQueryParser.parse(searchLiteral, NiFiUserUtils.getNiFiUser(), rootGroup, activeGroup);
 
-        controllerSearchService.search(results, search, rootGroup);
+        if (!StringUtils.isEmpty(searchQuery.getTerm())) {
+            controllerSearchService.search(searchQuery, results);
+            controllerSearchService.searchParameters(searchQuery, results);
+        }
 
         return results;
     }
@@ -1604,7 +1623,6 @@ public class ControllerFacade implements Authorizable {
     public void verifyComponentTypes(VersionedProcessGroup versionedFlow) {
         flowController.verifyComponentTypesInSnippet(versionedFlow);
     }
-
 
     public ProcessorDiagnosticsDTO getProcessorDiagnostics(final ProcessorNode processor, final ProcessorStatus processorStatus, final BulletinRepository bulletinRepository,
             final Function<String, ControllerServiceEntity> serviceEntityFactory) {
@@ -1614,28 +1632,29 @@ public class ControllerFacade implements Authorizable {
     /*
      * setters
      */
+
     public void setFlowController(FlowController flowController) {
         this.flowController = flowController;
-    }
-
-    public void setProperties(NiFiProperties properties) {
-        this.properties = properties;
-    }
-
-    public void setAuthorizer(Authorizer authorizer) {
-        this.authorizer = authorizer;
     }
 
     public void setFlowService(FlowService flowService) {
         this.flowService = flowService;
     }
 
+    public void setAuthorizer(Authorizer authorizer) {
+        this.authorizer = authorizer;
+    }
+
+    public void setProperties(NiFiProperties properties) {
+        this.properties = properties;
+    }
+
     public void setDtoFactory(DtoFactory dtoFactory) {
         this.dtoFactory = dtoFactory;
     }
 
-    public void setVariableRegistry(VariableRegistry variableRegistry) {
-        this.variableRegistry = variableRegistry;
+    public void setSearchQueryParser(SearchQueryParser searchQueryParser) {
+        this.searchQueryParser = searchQueryParser;
     }
 
     public void setControllerSearchService(ControllerSearchService controllerSearchService) {

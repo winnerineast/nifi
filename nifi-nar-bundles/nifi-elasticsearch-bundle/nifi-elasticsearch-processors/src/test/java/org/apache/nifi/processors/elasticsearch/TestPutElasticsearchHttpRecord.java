@@ -41,10 +41,14 @@ import org.junit.Ignore;
 import org.junit.Test;
 
 import java.io.IOException;
+import java.math.BigDecimal;
 import java.net.ConnectException;
 import java.sql.Date;
 import java.sql.Time;
 import java.sql.Timestamp;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.time.format.DateTimeFormatter;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -53,7 +57,7 @@ import java.util.function.Consumer;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
-import static org.mockito.Matchers.any;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -68,34 +72,36 @@ public class TestPutElasticsearchHttpRecord {
     @Test
     public void testPutElasticSearchOnTriggerIndex() throws IOException {
         PutElasticsearchHttpRecordTestProcessor processor = new PutElasticsearchHttpRecordTestProcessor(false);
+        DateTimeFormatter timeFormatter = DateTimeFormatter.ofPattern("h:m a");
+        DateTimeFormatter dateTimeFormatter = DateTimeFormatter.ofPattern("d/M/YYYY h:m a");
         processor.setRecordChecks(record -> {
             assertEquals(1, record.get("id"));
             assertEquals("reç1", record.get("name"));
             assertEquals(101, record.get("code"));
             assertEquals("20/12/2018", record.get("date"));
-            assertEquals("6:55 PM", record.get("time"));
-            assertEquals("20/12/2018 6:55 PM", record.get("ts"));
+            assertEquals(LocalTime.of(18, 55).format(timeFormatter), record.get("time"));
+            assertEquals(LocalDateTime.of(2018, 12, 20, 18, 55).format(dateTimeFormatter), record.get("ts"));
         }, record -> {
             assertEquals(2, record.get("id"));
             assertEquals("reç2", record.get("name"));
             assertEquals(102, record.get("code"));
             assertEquals("20/12/2018", record.get("date"));
-            assertEquals("6:55 PM", record.get("time"));
-            assertEquals("20/12/2018 6:55 PM", record.get("ts"));
+            assertEquals(LocalTime.of(18, 55).format(timeFormatter), record.get("time"));
+            assertEquals(LocalDateTime.of(2018, 12, 20, 18, 55).format(dateTimeFormatter), record.get("ts"));
         }, record -> {
             assertEquals(3, record.get("id"));
             assertEquals("reç3", record.get("name"));
             assertEquals(103, record.get("code"));
             assertEquals("20/12/2018", record.get("date"));
-            assertEquals("6:55 PM", record.get("time"));
-            assertEquals("20/12/2018 6:55 PM", record.get("ts"));
+            assertEquals(LocalTime.of(18, 55).format(timeFormatter), record.get("time"));
+            assertEquals(LocalDateTime.of(2018, 12, 20, 18, 55).format(dateTimeFormatter), record.get("ts"));
         }, record -> {
             assertEquals(4, record.get("id"));
             assertEquals("reç4", record.get("name"));
             assertEquals(104, record.get("code"));
             assertEquals("20/12/2018", record.get("date"));
-            assertEquals("6:55 PM", record.get("time"));
-            assertEquals("20/12/2018 6:55 PM", record.get("ts"));
+            assertEquals(LocalTime.of(18, 55).format(timeFormatter), record.get("time"));
+            assertEquals(LocalDateTime.of(2018, 12, 20, 18, 55).format(dateTimeFormatter), record.get("ts"));
         });
         runner = TestRunners.newTestRunner(processor); // no failures
         generateTestData();
@@ -659,9 +665,10 @@ public class TestPutElasticsearchHttpRecord {
         parser.addSchemaField("date", RecordFieldType.DATE);
         parser.addSchemaField("time", RecordFieldType.TIME);
         parser.addSchemaField("ts", RecordFieldType.TIMESTAMP);
+        parser.addSchemaField("amount", RecordFieldType.DECIMAL);
 
         for(int i=1; i<=numRecords; i++) {
-            parser.addRecord(i, "reç" + i, 100 + i, new Date(1545282000000L), new Time(68150000), new Timestamp(1545332150000L));
+            parser.addRecord(i, "reç" + i, 100 + i, new Date(1545282000000L), new Time(68150000), new Timestamp(1545332150000L), new BigDecimal(Double.MAX_VALUE).multiply(BigDecimal.TEN));
         }
     }
 
